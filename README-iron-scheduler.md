@@ -1,8 +1,8 @@
-# Mid-Print Per-Object Iron Scheduler — Installation Guide
+# Manual install guide
 
-Schedule ironing on **remaining top layers** for **one object** mid-print, using the same labeled-object list as Mainsail **Exclude Objects**. Pick the object on a **bed-map** (not a text list).
+> **Overview, quick install, and usage:** see [README.md](README.md).
 
-Tested on: Klipper + Moonraker + Mainsail, OrcaSlicer with **Label objects** enabled.
+Detailed step-by-step install for Klipper + Moonraker + Mainsail, OrcaSlicer with **Label objects** enabled.
 
 ---
 
@@ -327,7 +327,8 @@ flowchart LR
 
 ```
 printer_data/
-├── README-iron-scheduler.md          ← this guide
+├── README.md                         ← main repo readme
+├── README-iron-scheduler.md          ← this guide (manual install)
 ├── install-iron-scheduler.sh
 ├── config/
 │   └── iron_scheduler.cfg
