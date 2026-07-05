@@ -33,12 +33,19 @@ def layer_from_file_position(cache: dict, file_position: int) -> int:
     return best
 
 
-def get_current_layer(cache: dict) -> int:
+def get_print_status() -> dict:
     try:
         resp = moonraker_get(
             "/printer/objects/query?print_stats&virtual_sdcard&gcode_move"
         )
-        status = resp["result"]["status"]
+        return resp["result"]["status"]
+    except (KeyError, urllib.error.URLError, json.JSONDecodeError):
+        return {}
+
+
+def get_current_layer(cache: dict, status: dict | None = None) -> int:
+    try:
+        status = status or get_print_status()
         print_stats = status.get("print_stats", {})
         info = print_stats.get("info", {})
         cur = int(info.get("current_layer") or 0)
@@ -50,13 +57,20 @@ def get_current_layer(cache: dict) -> int:
         if not cache.get("layer_byte_offsets") or fp <= 0:
             return 0
 
-        # Do not require is_active — some hosts keep it false while printing.
         state = str(print_stats.get("state") or "")
         if state in ("printing", "paused") or vsd.get("is_active"):
             return layer_from_file_position(cache, fp)
-    except (KeyError, urllib.error.URLError, json.JSONDecodeError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError):
         return 0
     return 0
+
+
+def get_file_position(status: dict | None = None) -> int:
+    try:
+        status = status or get_print_status()
+        return int(status.get("virtual_sdcard", {}).get("file_position") or 0)
+    except (KeyError, TypeError, ValueError):
+        return 0
 
 
 def get_print_state() -> str:
@@ -72,6 +86,28 @@ def load_cache(gcode_file: Path) -> dict:
     if not cache_path.is_file():
         return {}
     return json.loads(cache_path.read_text())
+
+
+def inject_after_byte(cache: dict, object_name: str, layer: int) -> int | None:
+    """Byte offset in gcode file after the object's top surface (preferred) or block."""
+    objects = cache.get("objects", {})
+    obj = objects.get(object_name)
+    if not obj:
+        folded = {k.casefold(): k for k in objects}
+        key = folded.get(object_name.casefold())
+        if key:
+            obj = objects[key]
+    if not obj:
+        return None
+
+    offsets = obj.get("inject_after_byte") or {}
+    if str(layer) in offsets:
+        return int(offsets[str(layer)])
+
+    layer_offsets = cache.get("layer_byte_offsets") or {}
+    if str(layer) in layer_offsets:
+        return int(layer_offsets[str(layer)])
+    return None
 
 
 def main() -> int:
@@ -117,6 +153,7 @@ def main() -> int:
 
     last_logged_layer = -1
     stale_layer_polls = 0
+    waiting_logged: set[int] = set()
     while True:
         state = get_print_state()
         if state not in ("printing", "paused"):
@@ -130,37 +167,46 @@ def main() -> int:
             time.sleep(1.5)
             continue
 
-        layer = get_current_layer(cache)
+        status = get_print_status()
+        layer = get_current_layer(cache, status)
+        file_pos = get_file_position(status)
         if layer != last_logged_layer and layer > 0:
-            log(f"layer watch file={gcode_file.name} layer={layer}")
+            log(f"layer watch file={gcode_file.name} layer={layer} file_pos={file_pos}")
             last_logged_layer = layer
             stale_layer_polls = 0
         elif layer <= 0:
             stale_layer_polls += 1
             if stale_layer_polls in (10, 40, 80):
-                try:
-                    resp = moonraker_get(
-                        "/printer/objects/query?print_stats&virtual_sdcard"
-                    )
-                    st = resp["result"]["status"]
-                    vsd = st.get("virtual_sdcard", {})
-                    ps = st.get("print_stats", {})
-                    log(
-                        f"layer detect stuck file={gcode_file.name} "
-                        f"state={ps.get('state')} is_active={vsd.get('is_active')} "
-                        f"file_pos={vsd.get('file_position')}"
-                    )
-                except (urllib.error.URLError, json.JSONDecodeError, KeyError):
-                    pass
-        injected = False
+                vsd = status.get("virtual_sdcard", {})
+                ps = status.get("print_stats", {})
+                log(
+                    f"layer detect stuck file={gcode_file.name} "
+                    f"state={ps.get('state')} is_active={vsd.get('is_active')} "
+                    f"file_pos={vsd.get('file_position')}"
+                )
+
+        obj_name = schedule["object"]
         for target in schedule.get("layers", []):
             if target in schedule.get("done", []):
                 continue
             if layer < target:
                 continue
+
+            trigger_byte = inject_after_byte(cache, obj_name, target)
+            if trigger_byte is not None and file_pos < trigger_byte:
+                if target not in waiting_logged:
+                    log(
+                        f"waiting top surface file={gcode_file.name} "
+                        f"object={obj_name} layer={target} "
+                        f"file_pos={file_pos} need_byte={trigger_byte}"
+                    )
+                    waiting_logged.add(target)
+                continue
+
             log(
-                f"inject {gcode_file.name} object={schedule['object']} "
-                f"layer={target} (detected_layer={layer})"
+                f"inject {gcode_file.name} object={obj_name} layer={target} "
+                f"(detected_layer={layer} file_pos={file_pos} "
+                f"trigger_byte={trigger_byte})"
             )
             proc = subprocess.run(
                 [
@@ -169,7 +215,7 @@ def main() -> int:
                     "--file",
                     str(gcode_file),
                     "--object",
-                    schedule["object"],
+                    obj_name,
                     "--layer",
                     str(target),
                 ],
@@ -180,7 +226,7 @@ def main() -> int:
             if proc.returncode == 0:
                 schedule.setdefault("done", []).append(target)
                 schedule_path.write_text(json.dumps(schedule, indent=2))
-                injected = True
+                waiting_logged.discard(target)
                 log(f"inject ok layer={target}")
             else:
                 err = (proc.stderr or proc.stdout or "unknown error").strip()

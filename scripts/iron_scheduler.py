@@ -20,7 +20,7 @@ PRINTER_DATA = Path(os.environ.get("PRINTER_DATA", "/home/x/printer_data"))
 GCODE_DIR = PRINTER_DATA / "gcodes"
 CACHE_DIR = PRINTER_DATA / "iron_cache"
 MOONRAKER_URL = os.environ.get("MOONRAKER_URL", "http://127.0.0.1:7125")
-CACHE_VERSION = 3
+CACHE_VERSION = 5
 
 CHANGE_LAYER_RE = re.compile(r"^;\s*(?:CHANGE_LAYER|LAYER_CHANGE)\b", re.I)
 Z_HEIGHT_RE = re.compile(r"^;\s*(?:Z_HEIGHT|Z):\s*([\d.]+)", re.I)
@@ -196,6 +196,8 @@ def cache_needs_rebuild(cache: dict[str, Any]) -> bool:
     if int(cache.get("cache_version") or 0) < CACHE_VERSION:
         return True
     for obj in cache.get("objects", {}).values():
+        if obj.get("layers") and not obj.get("inject_after_byte"):
+            return True
         for snippet in obj.get("layers", {}).values():
             if snippet and not iron_snippet_has_moves(snippet):
                 return True
@@ -436,6 +438,9 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
     feature = None
     feature_lines: list[str] = []
     object_features: dict[str, dict[str, dict[str, list[str]]]] = {}
+    object_layer_end_byte: dict[str, dict[str, int]] = {}
+    object_top_surface_end_byte: dict[str, dict[str, int]] = {}
+    object_had_top_surface: dict[str, bool] = {}
 
     def flush_feature() -> None:
         nonlocal feature, feature_lines
@@ -451,6 +456,8 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
 
     for line in text:
         stripped = line.strip()
+        line_byte_len = len(line) + 1
+
         define = EXCLUDE_DEFINE_RE.match(stripped)
         if define:
             name = define.group("name")
@@ -474,12 +481,14 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
             )
             if polygon and not objects[name].get("polygon"):
                 objects[name]["polygon"] = polygon
+            file_offset += line_byte_len
             continue
 
         start = EXCLUDE_START_RE.match(stripped)
         if start:
             flush_feature()
             current_object = start.group("name")
+            object_had_top_surface[current_object] = False
             objects.setdefault(
                 current_object,
                 {
@@ -489,17 +498,31 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
                     "layers": {},
                 },
             )
+            file_offset += line_byte_len
             continue
 
         end = EXCLUDE_END_RE.match(stripped)
         if end:
             flush_feature()
+            ended_obj = end.group("name")
+            if layer_num > 0:
+                end_byte = file_offset + len(line) + 1
+                object_layer_end_byte.setdefault(ended_obj, {})[
+                    str(layer_num)
+                ] = end_byte
+                if object_had_top_surface.get(ended_obj):
+                    object_top_surface_end_byte.setdefault(ended_obj, {})[
+                        str(layer_num)
+                    ] = end_byte
+            object_had_top_surface.pop(ended_obj, None)
             current_object = None
+            file_offset += line_byte_len
             continue
 
         total_match = TOTAL_LAYERS_RE.match(stripped)
         if total_match:
             total_layers = int(total_match.group(1))
+            file_offset += line_byte_len
             continue
 
         if CHANGE_LAYER_RE.match(stripped):
@@ -507,6 +530,7 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
             layer_num += 1
             total_layers = max(total_layers, layer_num)
             layer_byte_offsets[str(layer_num)] = file_offset
+            file_offset += line_byte_len
             continue
 
         z_match = Z_HEIGHT_RE.match(stripped)
@@ -514,17 +538,22 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
             layer_z = float(z_match.group(1))
             if layer_num > 0:
                 layer_z_by_num[layer_num] = layer_z
+            file_offset += line_byte_len
             continue
 
         lh_match = LAYER_HEIGHT_RE.match(stripped)
         if lh_match:
             layer_height = float(lh_match.group(1))
+            file_offset += line_byte_len
             continue
 
         feat_match = FEATURE_RE.match(stripped)
         if feat_match:
             flush_feature()
             feature = feat_match.group(1).strip()
+            if current_object and feature.casefold() == "top surface":
+                object_had_top_surface[current_object] = True
+            file_offset += line_byte_len
             continue
 
         if feature == "Ironing":
@@ -538,7 +567,7 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
         if feature and stripped and not stripped.startswith(";"):
             feature_lines.append(stripped)
 
-        file_offset += len(line) + 1
+        file_offset += line_byte_len
 
     flush_feature()
 
@@ -598,9 +627,21 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
                     "template" if iron_template else "synth"
                 )
 
+        inject_after_byte: dict[str, int] = {}
+        for layer_key in obj_layers:
+            if layer_key in object_top_surface_end_byte.get(obj_name, {}):
+                inject_after_byte[layer_key] = object_top_surface_end_byte[
+                    obj_name
+                ][layer_key]
+            elif layer_key in object_layer_end_byte.get(obj_name, {}):
+                inject_after_byte[layer_key] = object_layer_end_byte[obj_name][
+                    layer_key
+                ]
+
         obj["layers"] = obj_layers
         obj["layer_sources"] = layer_sources
         obj["has_slicer_iron"] = has_slicer
+        obj["inject_after_byte"] = inject_after_byte
 
     ironing_settings = {
         "flow": meta["ironing_flow"],
