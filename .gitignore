@@ -1,0 +1,37 @@
+# Runtime / generated
+iron_cache/
+logs/
+gcodes/
+database/
+comms/
+misc/
+certs/
+__pycache__/
+*.pyc
+*.pyo
+
+# Machine-specific Klipper/Moonraker config (keep iron_scheduler.cfg)
+config/printer*.cfg
+config/printer.cfg*
+config/mainsail.cfg
+config/moonraker.conf
+config/.moonraker.conf.bkp
+config/KAMP_Settings.cfg
+config/nevermore.cfg
+config/TEST_SPEED.cfg
+config/variables.cfg*
+config/homing-backup-*
+config/KAMP
+
+# Env files with paths
+systemd/klipper.env
+systemd/moonraker.env
+
+# Moonraker/Klipper metadata
+.moonraker.uuid
+moonraker.asvc
+
+# OS / editor
+.DS_Store
+*~
+*.swp

@@ -1,0 +1,122 @@
+/* Mainsail-style modal overlay (matches Exclude Object dialog) */
+.iron-ms-overlay[hidden] {
+  display: none !important;
+}
+
+.iron-ms-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2400;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.iron-ms-scrim {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.iron-ms-dialog {
+  position: relative;
+  width: min(900px, 100%);
+  height: min(640px, calc(100vh - 48px));
+  max-height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+  background: #1e1e1e;
+  color: #eee;
+  border-radius: 4px;
+  box-shadow: 0 11px 15px -7px rgba(0, 0, 0, 0.2), 0 24px 38px 3px rgba(0, 0, 0, 0.14);
+  overflow: hidden;
+}
+
+.iron-ms-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #333;
+  background: #1e1e1e;
+}
+
+.iron-ms-header h2 {
+  margin: 0;
+  font: 600 1.1rem/1.2 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  flex: 1;
+}
+
+.iron-ms-close {
+  background: transparent;
+  border: none;
+  color: #eee;
+  font-size: 1.25rem;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.iron-ms-close:hover {
+  background: #2a2a2a;
+}
+
+.iron-ms-body {
+  padding: 12px 16px 16px;
+  overflow: hidden;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.iron-picker-root {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.iron-picker-root .filename {
+  margin: 0 0 6px;
+  flex-shrink: 0;
+}
+
+.iron-picker-root .bed-wrap {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+  max-height: 420px;
+}
+
+.iron-picker-root .bed-wrap svg {
+  min-height: 0;
+  height: 100%;
+}
+
+.iron-picker-root .legend {
+  margin-top: 8px;
+  flex-shrink: 0;
+}
+
+body.iron-ms-open {
+  overflow: hidden;
+}
+
+.iron-picker-root .mode-dialog {
+  z-index: 2500;
+}
+
+@media (max-width: 600px) {
+  .iron-ms-overlay {
+    padding: 0;
+  }
+
+  .iron-ms-dialog {
+    width: 100%;
+    max-height: 100vh;
+    height: 100vh;
+    border-radius: 0;
+  }
+}

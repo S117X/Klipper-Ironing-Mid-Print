@@ -1,0 +1,16 @@
+[Unit]
+Description=Iron Scheduler HTTP API
+After=network-online.target moonraker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=x
+Group=x
+Environment=PRINTER_DATA=/home/x/printer_data
+ExecStart=/usr/bin/python3 /home/x/printer_data/scripts/iron_api_server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
