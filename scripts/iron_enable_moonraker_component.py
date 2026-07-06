@@ -41,10 +41,20 @@ class IronEnableComponent:
         self.server.register_endpoint(
             "/server/iron/schedule", RequestType.GET, self._handle_schedule
         )
+        self.server.register_endpoint(
+            "/server/iron/cache", RequestType.GET, self._handle_cache
+        )
         logging.info("Iron enable API loaded at /server/iron/enable")
 
     async def _handle_health(self, web_request: WebRequest) -> dict[str, bool]:
         return {"ok": True}
+
+    async def _handle_cache(self, web_request: WebRequest) -> dict[str, Any]:
+        args = web_request.get_args()
+        filename = args.get("file") or args.get("filename")
+        if not filename:
+            raise self.server.error("file required", 400)
+        return await asyncio.to_thread(_read_cache, str(filename))
 
     async def _handle_schedule(self, web_request: WebRequest) -> dict[str, Any]:
         args = web_request.get_args()
@@ -69,6 +79,86 @@ class IronEnableComponent:
         return result
 
 
+def _gcode_path(filename: str) -> Path | None:
+    name = Path(filename).name
+    for candidate in (PRINTER_DATA / "gcodes" / name, Path(filename)):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _ensure_indexed(filename: str) -> None:
+    gcode = _gcode_path(filename)
+    if not gcode:
+        return
+    cache_path = CACHE_DIR / f"{Path(filename).name}.json"
+    try:
+        stale = (
+            not cache_path.is_file()
+            or cache_path.stat().st_mtime < gcode.stat().st_mtime
+        )
+    except OSError:
+        stale = True
+    if not stale:
+        return
+    subprocess.run(
+        [sys.executable, str(SCRIPT), "index", "--file", gcode.name],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(PRINTER_DATA),
+    )
+
+
+def _drop_stale_schedule_file(
+    name: str, data: dict[str, Any], print_duration: float, print_state: str
+) -> bool:
+    path = CACHE_DIR / f"{name}.schedule.json"
+    if print_state in ("complete", "standby", "cancelled"):
+        path.unlink(missing_ok=True)
+        return True
+    gcode = _gcode_path(name)
+    if gcode:
+        try:
+            gcode_mt = gcode.stat().st_mtime
+            sched_gcode_mt = float(data.get("gcode_mtime") or 0)
+            if sched_gcode_mt and gcode_mt > sched_gcode_mt + 0.5:
+                path.unlink(missing_ok=True)
+                return True
+        except OSError:
+            pass
+    sched_at = data.get("print_duration_at_schedule")
+    if sched_at is not None and print_duration + 5 < float(sched_at):
+        path.unlink(missing_ok=True)
+        return True
+    return False
+
+
+def _read_cache(filename: str) -> dict[str, Any]:
+    _ensure_indexed(filename)
+    name = Path(filename).name
+    path = CACHE_DIR / f"{name}.json"
+    if not path.is_file():
+        return {"ok": False, "error": "not indexed"}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "invalid cache"}
+    objects: dict[str, Any] = {}
+    for obj_name, obj in data.get("objects", {}).items():
+        objects[obj_name] = {
+            "has_slicer_iron": bool(obj.get("has_slicer_iron")),
+            "layers": sorted(obj.get("layers", {}).keys(), key=int),
+            "layer_sources": obj.get("layer_sources", {}),
+        }
+    return {
+        "ok": True,
+        "objects": objects,
+        "ironing_settings": data.get("ironing_settings", {}),
+        "total_layers": data.get("total_layers"),
+    }
+
+
 def _read_schedule(filename: str) -> dict[str, Any]:
     name = Path(filename).name
     path = CACHE_DIR / f"{name}.schedule.json"
@@ -77,19 +167,16 @@ def _read_schedule(filename: str) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text())
     except json.JSONDecodeError:
+        path.unlink(missing_ok=True)
         return {"ok": True, "schedule": None}
     if data.get("file") != name:
+        path.unlink(missing_ok=True)
         return {"ok": True, "schedule": None}
 
     stats = _current_print_stats()
     print_duration = float(stats.get("print_duration") or 0)
     print_state = str(stats.get("state") or "")
-    if print_state in ("complete", "standby", "cancelled"):
-        return {"ok": True, "schedule": None}
-    sched_at = data.get("print_duration_at_schedule")
-    if sched_at is not None and print_duration + 5 < float(sched_at):
-        return {"ok": True, "schedule": None}
-    if sched_at is None and not data.get("active") and data.get("done") and print_duration < 30:
+    if _drop_stale_schedule_file(name, data, print_duration, print_state):
         return {"ok": True, "schedule": None}
     return {"ok": True, "schedule": data}
 

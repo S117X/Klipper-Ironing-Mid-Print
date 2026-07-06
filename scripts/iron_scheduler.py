@@ -389,9 +389,57 @@ def wrap_slicer_iron(
     ]
 
 
+def gcode_mtime(gcode_file: Path) -> float:
+    try:
+        return gcode_file.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def cache_is_stale(gcode_file: Path, cache_path: Path) -> bool:
+    if not cache_path.is_file():
+        return True
+    try:
+        return cache_path.stat().st_mtime < gcode_mtime(gcode_file)
+    except OSError:
+        return True
+
+
+def drop_stale_schedule(
+    gcode_file: Path, print_duration: float, print_state: str = ""
+) -> None:
+    """Remove schedule files left from a prior job or an older gcode upload."""
+    path = schedule_path_for(gcode_file)
+    if not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        path.unlink(missing_ok=True)
+        return
+    if data.get("file") != gcode_file.name:
+        path.unlink(missing_ok=True)
+        return
+    if print_state in ("complete", "standby", "cancelled"):
+        path.unlink(missing_ok=True)
+        return
+
+    gcode_mt = gcode_mtime(gcode_file)
+    sched_gcode_mt = float(data.get("gcode_mtime") or 0)
+    if sched_gcode_mt and gcode_mt > sched_gcode_mt + 0.5:
+        path.unlink(missing_ok=True)
+        return
+
+    sched_at = data.get("print_duration_at_schedule")
+    if sched_at is not None and print_duration + 5 < float(sched_at):
+        path.unlink(missing_ok=True)
+        return
+
+
 def load_schedule(
     gcode_file: Path, print_duration: float, print_state: str = ""
 ) -> dict[str, Any] | None:
+    drop_stale_schedule(gcode_file, print_duration, print_state)
     path = schedule_path_for(gcode_file)
     if not path.is_file():
         return None
@@ -405,9 +453,6 @@ def load_schedule(
         return None
     sched_at = data.get("print_duration_at_schedule")
     if sched_at is not None and print_duration + 5 < float(sched_at):
-        return None
-    # Schedule left over from a previous completed print (same gcode filename).
-    if sched_at is None and not data.get("active") and data.get("done") and print_duration < 30:
         return None
     return data
 
@@ -732,16 +777,21 @@ def cmd_index(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_enable(args: argparse.Namespace) -> int:
-    gcode_file = resolve_gcode_file(args.file)
+def ensure_indexed(gcode_file: Path) -> dict[str, Any]:
     cache_path = cache_path_for(gcode_file)
+    if cache_is_stale(gcode_file, cache_path):
+        return index_gcode(gcode_file)
     if cache_path.is_file():
         cache = json.loads(cache_path.read_text())
         if cache_needs_rebuild(cache):
-            index_gcode(gcode_file)
-    else:
-        index_gcode(gcode_file)
-    cache = json.loads(cache_path.read_text())
+            return index_gcode(gcode_file)
+        return cache
+    return index_gcode(gcode_file)
+
+
+def cmd_enable(args: argparse.Namespace) -> int:
+    gcode_file = resolve_gcode_file(args.file)
+    cache = ensure_indexed(gcode_file)
 
     status = get_print_state()
     print_stats = status.get("print_stats", {})
@@ -815,6 +865,7 @@ def cmd_enable(args: argparse.Namespace) -> int:
         "done": [],
         "active": True,
         "print_duration_at_schedule": print_duration,
+        "gcode_mtime": gcode_mtime(gcode_file),
     }
     schedule_path_for(gcode_file).write_text(json.dumps(schedule, indent=2))
 

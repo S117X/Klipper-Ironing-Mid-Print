@@ -196,6 +196,14 @@
       return name.toLowerCase() === this.state.scheduledObject.toLowerCase();
     }
 
+    hasOtherScheduled(name) {
+      return !!(
+        this.state.scheduledObject &&
+        name &&
+        !this.isScheduled(name)
+      );
+    }
+
     hasSlicerIron(name) {
       if (!name) return false;
       const entry = this.state.ironCache[name]
@@ -273,23 +281,27 @@
     }
 
     selectObject(name) {
-      if (
-        !name
-        || this.state.excluded.includes(name)
-        || this.isScheduled(name)
-        || this.hasSlicerIron(name)
-        || !this.printActive()
-      ) {
-        if (this.isScheduled(name)) {
-          this.setStatus(`Iron already scheduled for ${this.shortLabel(name)}`);
-        } else if (this.hasSlicerIron(name)) {
-          this.setStatus(`${this.shortLabel(name)} already has slicer ironing in gcode`);
-        }
+      if (!name || this.state.excluded.includes(name) || !this.printActive()) {
+        return;
+      }
+      if (this.hasSlicerIron(name)) {
+        this.setStatus(`${this.shortLabel(name)} already has OrcaSlicer ironing in this file`);
+        return;
+      }
+      if (this.isScheduled(name)) {
+        this.setStatus(`Injector iron already scheduled for ${this.shortLabel(name)}`);
         return;
       }
       this.state.selected = name;
       this.renderMap();
-      this.setStatus("");
+      if (this.hasOtherScheduled(name)) {
+        this.setStatus(
+          `${this.shortLabel(this.state.scheduledObject)} is scheduled. ` +
+            `You can view ${this.shortLabel(name)}, but only one object per print.`
+        );
+      } else {
+        this.setStatus("");
+      }
       this.updateModeDialog();
     }
 
@@ -534,10 +546,15 @@
         this.renderMap();
         setTimeout(() => this.closeModeDialog(), 1500);
       } catch (err) {
-        const msg =
+        let msg =
           err.name === "TimeoutError" || err.name === "AbortError"
             ? "Request timed out"
             : err.message;
+        if (/only one object per print/i.test(msg)) {
+          msg = `Only one object per print. ${this.shortLabel(this.state.scheduledObject || "")} is already scheduled.`;
+        } else if (/already has slicer ironing/i.test(msg)) {
+          msg = `${this.shortLabel(this.state.selected || "")} already has OrcaSlicer ironing in this gcode file`;
+        }
         this.setStatus(`Failed: ${msg}`);
       } finally {
         this.state.busy = false;
@@ -550,11 +567,20 @@
       const toolhead = payload.toolhead || {};
       const printStats = payload.print_stats || {};
 
+      const prevFile = this.state.filename;
+      const nextFile = printStats.filename || "";
+      if (prevFile && nextFile && prevFile !== nextFile) {
+        this.state.scheduledObject = null;
+        this.state.ironCache = {};
+        this.state.selected = null;
+        this.closeModeDialog();
+      }
+
       this.state.objects = ex.objects || [];
       this.state.excluded = ex.excluded_objects || [];
       this.state.current = ex.current_object || null;
       this.state.printState = printStats.state || "standby";
-      this.state.filename = printStats.filename || "";
+      this.state.filename = nextFile;
 
       if (toolhead.axis_minimum) this.state.axisMin = toolhead.axis_minimum;
       if (toolhead.axis_maximum) this.state.axisMax = toolhead.axis_maximum;
