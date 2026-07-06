@@ -89,6 +89,14 @@ def watcher_lock_path(gcode_file: Path) -> Path:
     return CACHE_DIR / f"{gcode_file.name}.watcher.lock"
 
 
+def session_guard_lock_path(gcode_file: Path) -> Path:
+    return CACHE_DIR / f"{gcode_file.name}.session.lock"
+
+
+def trigger_lock_path(gcode_file: Path) -> Path:
+    return CACHE_DIR / f"{gcode_file.name}.trigger.lock"
+
+
 SCHEDULE_VERSION = 2
 
 
@@ -152,44 +160,30 @@ def schedule_all_complete(schedule: dict[str, Any]) -> bool:
     return True
 
 
-def watcher_is_running(gcode_file: Path) -> bool:
-    lock = watcher_lock_path(gcode_file)
-    if not lock.is_file():
+def _process_running(lock_path: Path) -> bool:
+    if not lock_path.is_file():
         return False
     try:
-        pid = int(lock.read_text().strip())
+        pid = int(lock_path.read_text().strip())
         os.kill(pid, 0)
         return True
     except (OSError, ValueError):
-        lock.unlink(missing_ok=True)
+        lock_path.unlink(missing_ok=True)
         return False
 
 
-def start_watcher(gcode_file: Path) -> None:
-    lock = watcher_lock_path(gcode_file)
-    if watcher_is_running(gcode_file):
-        return
-    acquired = False
-    for _ in range(5):
-        if watcher_is_running(gcode_file):
-            return
-        try:
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            os.close(fd)
-            acquired = True
-            break
-        except FileExistsError:
-            if watcher_is_running(gcode_file):
-                return
-            lock.unlink(missing_ok=True)
-            time.sleep(0.05)
-    if not acquired:
-        return
-    watcher = Path(__file__).with_name("iron_watcher.py")
-    proc = subprocess.Popen(
+def watcher_is_running(gcode_file: Path) -> bool:
+    return _process_running(session_guard_lock_path(gcode_file)) or _process_running(
+        trigger_lock_path(gcode_file)
+    )
+
+
+def _spawn_daemon(script_name: str, gcode_file: Path) -> None:
+    script = Path(__file__).with_name(script_name)
+    subprocess.Popen(
         [
             sys.executable,
-            str(watcher),
+            str(script),
             "--file",
             str(gcode_file),
             "--schedule",
@@ -199,7 +193,26 @@ def start_watcher(gcode_file: Path) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    lock.write_text(str(proc.pid))
+
+
+def start_session_guard(gcode_file: Path) -> None:
+    lock = session_guard_lock_path(gcode_file)
+    if _process_running(lock):
+        return
+    _spawn_daemon("iron_session_guard.py", gcode_file)
+
+
+def start_inject_trigger(gcode_file: Path) -> None:
+    lock = trigger_lock_path(gcode_file)
+    if _process_running(lock):
+        return
+    _spawn_daemon("iron_inject_trigger.py", gcode_file)
+
+
+def start_watcher(gcode_file: Path) -> None:
+    """Start session guard (cleanup) + inject trigger (fires at byte triggers)."""
+    start_session_guard(gcode_file)
+    start_inject_trigger(gcode_file)
 
 
 TERMINAL_PRINT_STATES = frozenset({"complete", "cancelled", "error", "standby"})
@@ -267,8 +280,17 @@ def cleanup_watcher_artifacts(
     gcode_file: Path,
     schedule_path: Path | None = None,
 ) -> None:
+    cleanup_session_artifacts(gcode_file, schedule_path)
+
+
+def cleanup_session_artifacts(
+    gcode_file: Path,
+    schedule_path: Path | None = None,
+) -> None:
     path = schedule_path or schedule_path_for(gcode_file)
     path.unlink(missing_ok=True)
+    session_guard_lock_path(gcode_file).unlink(missing_ok=True)
+    trigger_lock_path(gcode_file).unlink(missing_ok=True)
     watcher_lock_path(gcode_file).unlink(missing_ok=True)
 
 
@@ -1294,9 +1316,18 @@ def cmd_enable(args: argparse.Namespace) -> int:
     schedule["active"] = True
     schedule.setdefault("print_duration_at_schedule", print_duration)
     schedule.setdefault("gcode_mtime", gcode_mtime(gcode_file))
-    schedule_path_for(gcode_file).write_text(json.dumps(schedule, indent=2))
+    sched_path = schedule_path_for(gcode_file)
+    sched_path.write_text(json.dumps(schedule, indent=2))
 
     start_watcher(gcode_file)
+
+    try:
+        from iron_inject_trigger import attempt_inject_for_schedule
+
+        attempt_inject_for_schedule(gcode_file, sched_path)
+    except ImportError:
+        pass
+
     result = {
         "ok": True,
         "scheduled_layers": target_layers,

@@ -20,6 +20,8 @@ install_file() {
 install_file "$SCRIPT_DIR/scripts/iron_scheduler.py" "$PRINTER_DATA/scripts/iron_scheduler.py"
 install_file "$SCRIPT_DIR/scripts/inject_iron.py" "$PRINTER_DATA/scripts/inject_iron.py"
 install_file "$SCRIPT_DIR/scripts/iron_watcher.py" "$PRINTER_DATA/scripts/iron_watcher.py"
+install_file "$SCRIPT_DIR/scripts/iron_inject_trigger.py" "$PRINTER_DATA/scripts/iron_inject_trigger.py"
+install_file "$SCRIPT_DIR/scripts/iron_session_guard.py" "$PRINTER_DATA/scripts/iron_session_guard.py"
 install_file "$SCRIPT_DIR/config/iron_scheduler.cfg" "$PRINTER_DATA/config/iron_scheduler.cfg"
 install_file "$SCRIPT_DIR/scripts/patch-mainsail-iron-button.py" "$PRINTER_DATA/scripts/patch-mainsail-iron-button.py"
 install_file "$SCRIPT_DIR/scripts/iron_api_server.py" "$PRINTER_DATA/scripts/iron_api_server.py"
@@ -27,6 +29,8 @@ install_file "$SCRIPT_DIR/scripts/iron_api_server.py" "$PRINTER_DATA/scripts/iro
 chmod +x "$PRINTER_DATA/scripts/iron_scheduler.py" \
          "$PRINTER_DATA/scripts/inject_iron.py" \
          "$PRINTER_DATA/scripts/iron_watcher.py" \
+         "$PRINTER_DATA/scripts/iron_inject_trigger.py" \
+         "$PRINTER_DATA/scripts/iron_session_guard.py" \
          "$PRINTER_DATA/scripts/patch-mainsail-iron-button.py" \
          "$PRINTER_DATA/scripts/iron_api_server.py"
 

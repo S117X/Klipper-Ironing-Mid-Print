@@ -203,7 +203,10 @@ def inject_chain(
 
     state = print_state()
     if state in ("complete", "cancelled", "standby", "error"):
-        raise SystemExit(f"Refusing iron inject: print state is {state or 'unknown'}")
+        raise SystemExit(
+            f"Refusing iron inject: print state is {state or 'unknown'} "
+            "(inject must run while print is still active)"
+        )
 
     cache_path = CACHE_DIR / f"{Path(gcode_file).name}.json"
     if not cache_path.is_file():
