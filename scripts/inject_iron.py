@@ -13,7 +13,8 @@ from pathlib import Path
 PRINTER_DATA = Path(os.environ.get("PRINTER_DATA", "/home/x/printer_data"))
 CACHE_DIR = PRINTER_DATA / "iron_cache"
 MOONRAKER_URL = os.environ.get("MOONRAKER_URL", "http://127.0.0.1:7125")
-IRON_SCRIPT_TIMEOUT = 300
+IRON_LINE_BATCH = 12
+IRON_SCRIPT_TIMEOUT = 60
 
 
 def moonraker_get(path: str) -> dict:
@@ -22,29 +23,18 @@ def moonraker_get(path: str) -> dict:
         return json.loads(resp.read().decode())
 
 
-def moonraker_post(path: str, payload: dict | None = None) -> dict:
-    data = json.dumps(payload or {}).encode()
-    req = urllib.request.Request(
-        f"{MOONRAKER_URL}{path}",
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = resp.read().decode()
-        return json.loads(body) if body else {}
-
-
-def print_snapshot() -> dict:
-    try:
-        resp = moonraker_get("/printer/objects/query?print_stats&virtual_sdcard")
-        return resp.get("result", {}).get("status", {})
-    except (urllib.error.URLError, json.JSONDecodeError, KeyError):
-        return {}
-
-
 def print_state() -> str:
-    return str(print_snapshot().get("print_stats", {}).get("state") or "")
+    try:
+        resp = moonraker_get("/printer/objects/query?print_stats")
+        return str(
+            resp.get("result", {})
+            .get("status", {})
+            .get("print_stats", {})
+            .get("state")
+            or ""
+        )
+    except (urllib.error.URLError, json.JSONDecodeError, KeyError):
+        return ""
 
 
 def moonraker_script(script: str) -> None:
@@ -57,6 +47,26 @@ def moonraker_script(script: str) -> None:
     )
     with urllib.request.urlopen(req, timeout=IRON_SCRIPT_TIMEOUT) as resp:
         resp.read()
+
+
+def stream_iron_lines(snippet: str, object_name: str, layer: int) -> None:
+    moves = [line.strip() for line in snippet.splitlines() if line.strip()]
+    moonraker_script(
+        f"; IRON object={object_name} layer={layer}\n"
+        "SAVE_GCODE_STATE NAME=IRON_STATE"
+    )
+    batch: list[str] = []
+    for line in moves:
+        batch.append(line)
+        if len(batch) >= IRON_LINE_BATCH:
+            moonraker_script("\n".join(batch))
+            batch = []
+            state = print_state()
+            if state in ("complete", "cancelled", "standby", "error"):
+                raise SystemExit(f"Print ended during iron ({state})")
+    if batch:
+        moonraker_script("\n".join(batch))
+    moonraker_script("RESTORE_GCODE_STATE NAME=IRON_STATE MOVE=1")
 
 
 def main() -> int:
@@ -89,31 +99,7 @@ def main() -> int:
     if not snippet:
         raise SystemExit(f"No iron gcode for layer {args.layer}")
 
-    paused_for_iron = False
-    if state == "printing":
-        moonraker_post("/printer/print/pause")
-        paused_for_iron = True
-
-    script_lines = [
-        f"; IRON object={args.object} layer={args.layer}",
-        "SAVE_GCODE_STATE NAME=IRON_STATE",
-    ]
-    for line in snippet.splitlines():
-        line = line.strip()
-        if line:
-            script_lines.append(line)
-    script_lines.append("RESTORE_GCODE_STATE NAME=IRON_STATE MOVE=1")
-
-    try:
-        moonraker_script("\n".join(script_lines) + "\n")
-    finally:
-        if paused_for_iron:
-            after = print_state()
-            if after in ("printing", "paused"):
-                try:
-                    moonraker_post("/printer/print/resume")
-                except urllib.error.HTTPError:
-                    pass
+    stream_iron_lines(snippet, args.object, args.layer)
     return 0
 
 

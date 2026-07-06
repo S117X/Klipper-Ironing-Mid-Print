@@ -157,6 +157,60 @@ def watcher_is_running(gcode_file: Path) -> bool:
         return False
 
 
+def inject_trigger_byte(
+    cache: dict[str, Any], object_name: str, layer: int
+) -> int | None:
+    obj = cache.get("objects", {}).get(object_name)
+    if not obj:
+        folded = {k.casefold(): k for k in cache.get("objects", {})}
+        key = folded.get(object_name.casefold())
+        if key:
+            obj = cache["objects"][key]
+    if not obj:
+        return None
+    raw = (obj.get("inject_after_byte") or {}).get(str(layer))
+    return int(raw) if raw is not None else None
+
+
+def try_inject_layers(
+    gcode_file: Path,
+    object_name: str,
+    layers: list[int],
+    cache: dict[str, Any],
+    status: dict[str, Any],
+) -> list[int]:
+    """Inject immediately for layers whose top-surface byte offset is already passed."""
+    inject = Path(__file__).with_name("inject_iron.py")
+    fp = int(status.get("virtual_sdcard", {}).get("file_position") or 0)
+    cur = current_layer(cache, status)
+    injected: list[int] = []
+    for layer in layers:
+        if cur < layer:
+            continue
+        trigger = inject_trigger_byte(cache, object_name, layer)
+        if trigger is not None and fp < trigger:
+            continue
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(inject),
+                "--file",
+                str(gcode_file),
+                "--object",
+                object_name,
+                "--layer",
+                str(layer),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        if proc.returncode == 0:
+            injected.append(layer)
+    return injected
+
+
 def start_watcher(gcode_file: Path) -> None:
     if watcher_is_running(gcode_file):
         return
@@ -1008,7 +1062,7 @@ def cmd_enable(args: argparse.Namespace) -> int:
     target_layers = [
         layer
         for layer in layers_for_mode(cache, args.mode)
-        if layer > cur and str(layer) in obj["layers"]
+        if layer >= cur and str(layer) in obj["layers"]
     ]
     if not target_layers:
         result = {"ok": False, "error": "No remaining top layers to iron for this object"}
@@ -1038,8 +1092,29 @@ def cmd_enable(args: argparse.Namespace) -> int:
     schedule.setdefault("gcode_mtime", gcode_mtime(gcode_file))
     schedule_path_for(gcode_file).write_text(json.dumps(schedule, indent=2))
 
+    status = get_print_state()
+    injected_now = try_inject_layers(
+        gcode_file, canonical, target_layers, cache, status
+    )
+    if injected_now:
+        entry = schedule["objects"][canonical]
+        done = list(entry.get("done") or [])
+        for layer in injected_now:
+            if layer not in done:
+                done.append(layer)
+        entry["done"] = done
+        schedule["objects"][canonical] = entry
+        if schedule_all_complete(schedule):
+            schedule["active"] = False
+        schedule_path_for(gcode_file).write_text(json.dumps(schedule, indent=2))
+
     start_watcher(gcode_file)
-    result = {"ok": True, "scheduled_layers": target_layers, "object": canonical}
+    result = {
+        "ok": True,
+        "scheduled_layers": target_layers,
+        "object": canonical,
+        "injected_layers": injected_now,
+    }
     report_enable_result(result)
     print(json.dumps(result))
     return 0
