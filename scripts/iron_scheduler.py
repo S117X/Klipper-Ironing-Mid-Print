@@ -157,21 +157,6 @@ def watcher_is_running(gcode_file: Path) -> bool:
         return False
 
 
-def inject_trigger_byte(
-    cache: dict[str, Any], object_name: str, layer: int
-) -> int | None:
-    obj = cache.get("objects", {}).get(object_name)
-    if not obj:
-        folded = {k.casefold(): k for k in cache.get("objects", {})}
-        key = folded.get(object_name.casefold())
-        if key:
-            obj = cache["objects"][key]
-    if not obj:
-        return None
-    raw = (obj.get("inject_after_byte") or {}).get(str(layer))
-    return int(raw) if raw is not None else None
-
-
 def start_watcher(gcode_file: Path) -> None:
     if watcher_is_running(gcode_file):
         return
