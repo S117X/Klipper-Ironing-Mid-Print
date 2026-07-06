@@ -23,7 +23,10 @@ if str(SCRIPT_DIR) not in sys.path:
 import inject_iron  # noqa: E402
 
 from iron_scheduler import (  # noqa: E402
+    EOF_POLL_GAP,
+    FAST_POLL_GAP,
     FAST_POLL_INTERVAL,
+    ULTRA_POLL_INTERVAL,
     cleanup_watcher_artifacts,
     normalize_schedule,
     print_job_active,
@@ -176,9 +179,24 @@ def schedule_has_pending_iron(schedule: dict, layer: int) -> bool:
     return False
 
 
-def poll_interval(schedule: dict, layer: int, inflight: set[tuple[str, int]]) -> float:
-    """Fast poll while injects are outstanding or in-flight."""
+def poll_interval(
+    schedule: dict,
+    layer: int,
+    inflight: set[tuple[str, int]],
+    *,
+    cache: dict | None = None,
+    file_pos: int = 0,
+    waiting: list[tuple[int, str, int]] | None = None,
+) -> float:
+    """Fast poll while injects are outstanding or approaching triggers/EOF."""
     if inflight or schedule_has_pending_iron(schedule, layer):
+        if cache and waiting:
+            pe = cache.get("print_end_byte")
+            if pe is not None and int(pe) - file_pos <= EOF_POLL_GAP:
+                return ULTRA_POLL_INTERVAL
+            next_byte = min((entry[0] for entry in waiting if entry[0] > 0), default=0)
+            if next_byte and next_byte - file_pos <= FAST_POLL_GAP:
+                return ULTRA_POLL_INTERVAL
         return FAST_POLL_INTERVAL
     return 1.5
 
@@ -339,15 +357,18 @@ def main() -> int:
         waiting_logged.discard(wait_key)
         log(f"inject ok object={obj_name} layer={target}")
 
-    def start_chain_inject_async(
+    def run_chain_inject(
         batch: list[tuple[int, str, int]],
         layer: int,
         file_pos: int,
+        *,
+        sync: bool,
     ) -> None:
         """One Klipper script for all ready objects — avoids SD racing to PRINT_END."""
-        wait_keys = [(name, target) for _, name, target in batch]
         names = [f"{name}:L{target}" for _, name, target in batch]
         first_trigger = batch[0][0]
+        last_trigger = batch[-1][0]
+        multi = len(batch) > 1
 
         def worker() -> None:
             rc = 0
@@ -357,6 +378,8 @@ def main() -> int:
                     gcode_file.name,
                     [(name, target) for _, name, target in batch],
                     trigger_byte=first_trigger,
+                    last_trigger_byte=last_trigger,
+                    pre_hold_sd=multi,
                 )
             except SystemExit as exc:
                 rc = int(exc.code) if isinstance(exc.code, int) else 1
@@ -367,24 +390,21 @@ def main() -> int:
         log(
             f"inject chain {gcode_file.name} objects={names} "
             f"(detected_layer={layer} file_pos={file_pos} "
-            f"first_trigger={first_trigger})"
+            f"first_trigger={first_trigger} last_trigger={last_trigger} "
+            f"sync={sync})"
         )
-        threading.Thread(
-            target=worker, daemon=True, name=f"iron-chain-{batch[0][1]}"
-        ).start()
+        if sync:
+            worker()
+        else:
+            threading.Thread(
+                target=worker, daemon=True, name=f"iron-chain-{batch[0][1]}"
+            ).start()
 
     try:
         while True:
             status = get_print_status()
             if print_job_active(status):
                 seen_printing = True
-
-            finished, reason = print_job_finished(
-                status, gcode_file, seen_printing=seen_printing
-            )
-            if finished:
-                stop_watching(reason)
-                break
 
             if not schedule_path.is_file():
                 log(f"watcher exit: schedule removed file={gcode_file.name}")
@@ -512,10 +532,20 @@ def main() -> int:
                                 claimed = []
                                 break
                         if claimed:
-                            start_chain_inject_async(
-                                claimed, layer, file_pos
+                            run_chain_inject(
+                                claimed,
+                                layer,
+                                file_pos,
+                                sync=len(claimed) > 1,
                             )
                             launched_this_loop = True
+
+            finished, reason = print_job_finished(
+                status, gcode_file, seen_printing=seen_printing
+            )
+            if finished and not inflight:
+                stop_watching(reason)
+                break
 
             with schedule_lock:
                 try:
@@ -554,7 +584,16 @@ def main() -> int:
             if launched_this_loop or inflight:
                 continue
 
-            time.sleep(poll_interval(schedule, layer, inflight))
+            time.sleep(
+                poll_interval(
+                    schedule,
+                    layer,
+                    inflight,
+                    cache=cache,
+                    file_pos=file_pos,
+                    waiting=waiting,
+                )
+            )
     finally:
         lock_path.unlink(missing_ok=True)
 

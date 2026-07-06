@@ -69,7 +69,7 @@ def toolhead_xy() -> tuple[float, float] | None:
     return None
 
 
-def moonraker_script(script: str) -> None:
+def moonraker_script(script: str, *, timeout: float = IRON_SCRIPT_TIMEOUT) -> None:
     payload = json.dumps({"script": script}).encode()
     req = urllib.request.Request(
         f"{MOONRAKER_URL}/printer/gcode/script",
@@ -77,8 +77,13 @@ def moonraker_script(script: str) -> None:
         method="POST",
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=IRON_SCRIPT_TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         resp.read()
+
+
+def pause_sd() -> None:
+    """Pause virtual SD immediately — must run before SD reaches PRINT_END."""
+    moonraker_script("M25", timeout=10)
 
 
 def iron_move_stats(snippet: str) -> dict[str, float | int]:
@@ -188,6 +193,9 @@ def inject_chain(
     items: list[tuple[str, int]],
     trigger_byte: int | None = None,
     hold_sd: bool = False,
+    *,
+    last_trigger_byte: int | None = None,
+    pre_hold_sd: bool = False,
 ) -> int:
     """Inject all objects in one gcode/script — no pause, no gap between irons."""
     if not items:
@@ -206,30 +214,6 @@ def inject_chain(
     min_margin = int(cache.get("min_inject_margin") or 64)
     settings = cache.get("ironing_settings") or {}
 
-    file_pos = file_position()
-    if print_end_byte is not None:
-        if file_pos >= int(print_end_byte):
-            raise SystemExit(
-                f"Refusing iron inject: file_pos={file_pos} already at/past "
-                f"PRINT_END at {print_end_byte} (SD end macro likely ran)"
-            )
-        room_now = int(print_end_byte) - file_pos
-        room = room_now
-        if trigger_byte is not None:
-            room_at_trigger = int(print_end_byte) - int(trigger_byte)
-            if room_at_trigger >= min_margin:
-                room = room_at_trigger
-            elif room_now < min_margin:
-                live_log(
-                    f"INJECT_LATE file_pos={file_pos} trigger={trigger_byte} "
-                    f"print_end={print_end_byte} margin={room_at_trigger}"
-                )
-        if room < min_margin:
-            raise SystemExit(
-                f"Refusing iron inject: file_pos={file_pos} only {room_now} bytes "
-                f"before PRINT_END at {print_end_byte}"
-            )
-
     names = [f"{name}:L{layer}" for name, layer in items]
     xy = toolhead_xy()
     if hold_sd or any(
@@ -244,6 +228,47 @@ def inject_chain(
         for name, layer in items
     ):
         hold_sd = True
+
+    margin_byte = last_trigger_byte if last_trigger_byte is not None else trigger_byte
+    file_pos = file_position()
+    if print_end_byte is not None:
+        pe = int(print_end_byte)
+        room_now = pe - file_pos
+        room = room_now
+        if margin_byte is not None:
+            room_at_trigger = pe - int(margin_byte)
+            if room_at_trigger >= min_margin:
+                room = room_at_trigger
+            elif room_now < min_margin:
+                live_log(
+                    f"INJECT_LATE file_pos={file_pos} trigger={margin_byte} "
+                    f"print_end={pe} margin={room_at_trigger}"
+                )
+        if hold_sd:
+            if room < min_margin:
+                raise SystemExit(
+                    f"Refusing iron inject: only {room} bytes before PRINT_END at {pe} "
+                    f"(trigger={margin_byte})"
+                )
+        else:
+            if file_pos >= pe:
+                raise SystemExit(
+                    f"Refusing iron inject: file_pos={file_pos} already at/past "
+                    f"PRINT_END at {pe} (SD end macro likely ran)"
+                )
+            if room < min_margin:
+                raise SystemExit(
+                    f"Refusing iron inject: file_pos={file_pos} only {room_now} bytes "
+                    f"before PRINT_END at {pe}"
+                )
+
+    if pre_hold_sd and hold_sd and state == "printing":
+        try:
+            pause_sd()
+            live_log(f"PRE_HOLD file={gcode_file} objects={names} file_pos={file_pos}")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            live_log(f"PRE_HOLD_FAIL file={gcode_file} err={exc}")
+
     script, near_print_end = build_iron_script(cache, items, hold_sd=hold_sd)
     live_log(
         f"CHAIN_START file={gcode_file} objects={names} file_pos={file_pos} "

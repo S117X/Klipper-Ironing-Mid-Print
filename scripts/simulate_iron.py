@@ -180,7 +180,7 @@ def simulate_watcher_inject_plan(
     schedule: dict[str, Any],
     file_positions: list[int],
 ) -> list[tuple[str, int, int]]:
-    """Return immediate per-object inject events (object, layer, file_pos)."""
+    """Return batch inject events (object, layer, file_pos) in trigger order."""
     events: list[tuple[str, int, int]] = []
     sim_schedule = json.loads(json.dumps(schedule))
 
@@ -191,14 +191,18 @@ def simulate_watcher_inject_plan(
         )
         if not ready:
             continue
-        trigger_byte, obj_name, target = ready[0]
-        obj_sched = sim_schedule["objects"][obj_name]
-        done = set(obj_sched.get("done") or [])
-        if target in done:
+        batch_done = False
+        for trigger_byte, obj_name, target in ready:
+            obj_sched = sim_schedule["objects"][obj_name]
+            done = set(obj_sched.get("done") or [])
+            if target in done:
+                continue
+            events.append((obj_name, target, file_pos))
+            done.add(target)
+            obj_sched["done"] = sorted(done)
+            batch_done = True
+        if not batch_done:
             continue
-        events.append((obj_name, target, file_pos))
-        done.add(target)
-        obj_sched["done"] = sorted(done)
     return events
 
 
@@ -210,9 +214,9 @@ def build_inject_script(
 
 
 def build_chain_script(
-    cache: dict[str, Any], items: list[tuple[str, int]]
+    cache: dict[str, Any], items: list[tuple[str, int]], *, hold_sd: bool = True
 ) -> tuple[str, bool]:
-    return inject_iron.build_iron_script(cache, items)
+    return inject_iron.build_iron_script(cache, items, hold_sd=hold_sd)
 
 
 @dataclass
@@ -413,6 +417,8 @@ def simulate_async_watcher(
             next_byte = waiting[0][0]
             if file_pos < next_byte:
                 file_pos += max(min(next_byte - file_pos, int(sdcard_bps * 0.08)), 1)
+            else:
+                file_pos += int(sdcard_bps * 0.08)
         else:
             file_pos += int(sdcard_bps * 0.08)
         time_s += 0.08
@@ -481,7 +487,7 @@ def test_3m55s_dual_object_flow(cache: dict[str, Any]) -> None:
     if len(events) != 2:
         fail("3m55s inject count", f"got {events}")
     else:
-        ok("3m55s inject count", "2 objects")
+        ok("3m55s inject count", "2 objects in one batch")
 
     if events[0][0] != "Cube_1_id_1_copy_0":
         fail("3m55s inject order", f"first={events[0][0]} expected id_1")
@@ -490,24 +496,21 @@ def test_3m55s_dual_object_flow(cache: dict[str, Any]) -> None:
 
     if len(events) < 2:
         fail("3m55s inject timing", f"need 2 events, got {events}")
-    elif events[0][2] >= events[1][2]:
-        fail("3m55s inject timing", f"rear must fire before front: {events}")
+    elif events[0][2] != events[1][2]:
+        fail("3m55s inject timing", f"batch must fire together: {events}")
     else:
-        ok(
-            "3m55s inject timing",
-            f"rear@{events[0][2]} then front@{events[1][2]}",
-        )
+        ok("3m55s inject timing", f"batch@{events[0][2]} margin={pe - events[0][2]}")
 
     _, near0 = build_inject_script(cache, "Cube_1_id_0_copy_0", 10)
     _, near1 = build_inject_script(cache, "Cube_1_id_1_copy_0", 10)
     if not near0:
-        fail("3m55s id_0 near_print_end", "should append PRINT_END")
+        fail("3m55s id_0 near_print_end", "front flagged near EOF")
     else:
-        ok("3m55s id_0 near_print_end", "PRINT_END will run after iron")
+        ok("3m55s id_0 near_print_end", "M25 hold will run before iron")
     if near1:
-        fail("3m55s id_1 near_print_end", "should NOT append PRINT_END")
+        fail("3m55s id_1 near_print_end", "rear should NOT be near EOF")
     else:
-        ok("3m55s id_1 near_print_end", "no PRINT_END (enough margin)")
+        ok("3m55s id_1 near_print_end", "rear has enough margin")
 
     if pe - id0 > iron_scheduler.PRINT_END_MARGIN:
         fail("3m55s id_0 margin flag", f"margin={pe - id0}")
@@ -541,21 +544,20 @@ def test_byte_walk_handoff(cache: dict[str, Any]) -> None:
         return
 
     rear_pos, front_pos = rear[0][2], front[0][2]
-    if rear_pos < id1:
-        fail("byte-walk rear", f"rear@{rear_pos} before trigger {id1}")
-    elif front_pos < id0:
-        fail("byte-walk front", f"front@{front_pos} before trigger {id0}")
-    elif front_pos >= pe - min_margin:
+    batch_pos = rear_pos
+    if batch_pos < id0:
+        fail("byte-walk batch", f"batch@{batch_pos} before front trigger {id0}")
+    elif batch_pos >= pe - min_margin:
         fail(
-            "byte-walk front EOF",
-            f"front@{front_pos} too late (need <{pe - min_margin})",
+            "byte-walk batch EOF",
+            f"batch@{batch_pos} too late (need <{pe - min_margin})",
         )
-    elif rear_pos >= front_pos:
-        fail("byte-walk order", f"rear@{rear_pos} not before front@{front_pos}")
+    elif rear_pos != front_pos:
+        fail("byte-walk batch", f"expected same poll for both: {events}")
     else:
         ok(
             "byte-walk handoff",
-            f"rear@{rear_pos} front@{front_pos} margin={pe - front_pos}",
+            f"batch@{batch_pos} margin={pe - batch_pos}",
         )
 
 
@@ -596,10 +598,14 @@ def test_mock_inject_http(cache_dir: Path, cache: dict[str, Any]) -> None:
         ok0, err0 = run_inject("Cube_1_id_0_copy_0", 10)
         if ok0:
             script = printer.scripts[-1]
-            if "PRINT_END" in script and "IRON object=Cube_1_id_0_copy_0" in script:
-                ok("mock inject id_0", "front iron + PRINT_END")
+            if (
+                "M25" in script
+                and "PRINT_END" not in script
+                and "IRON object=Cube_1_id_0_copy_0" in script
+            ):
+                ok("mock inject id_0", "front iron + M25 hold, no PRINT_END")
             else:
-                fail("mock inject id_0", "missing PRINT_END tail")
+                fail("mock inject id_0", "expected M25 hold without PRINT_END")
         else:
             fail("mock inject id_0", err0)
 
@@ -718,17 +724,24 @@ def test_blocking_vs_async_race(cache_3m: dict[str, Any]) -> None:
         iron_duration_sec=IRON_INJECT_DURATION_SEC,
         sdcard_bps=SDCARD_BYTES_PER_SEC,
     )
-    front_async = [
-        e for e in async_events if e[0] == "Cube_1_id_0_copy_0" and e[3] == "inject_start"
+    batch_async = [
+        e
+        for e in async_events
+        if e[3] == "inject_start"
+        and e[0] in ("Cube_1_id_0_copy_0", "Cube_1_id_1_copy_0")
     ]
-    if not front_async:
-        fail("async race front", "front never injected")
+    front_async = [e for e in batch_async if e[0] == "Cube_1_id_0_copy_0"]
+    rear_async = [e for e in batch_async if e[0] == "Cube_1_id_1_copy_0"]
+    if not front_async or not rear_async:
+        fail("async race front", f"batch never injected: {batch_async}")
+    elif front_async[0][2] != rear_async[0][2]:
+        fail("async race front", f"batch not together: {batch_async}")
     elif not inject_would_succeed(cache_3m, front_async[0][2]):
-        fail("async race front", f"front@{front_async[0][2]} too late")
+        fail("async race front", f"batch@{front_async[0][2]} too late")
     else:
         ok(
             "async race front",
-            f"inject@{front_async[0][2]} margin={int(cache_3m['print_end_byte']) - front_async[0][2]}",
+            f"batch@{front_async[0][2]} margin={int(cache_3m['print_end_byte']) - front_async[0][2]}",
         )
 
 
@@ -939,12 +952,21 @@ def main() -> int:
         print("\n[6] Script content checks")
         script0, near0 = build_inject_script(cache_3m, "Cube_1_id_0_copy_0", 10)
         script1, near1 = build_inject_script(cache_3m, "Cube_1_id_1_copy_0", 10)
-        if "X109.275" in script0 and near0 and script0.strip().endswith("PRINT_END"):
-            ok("script id_0 content", "front-left coords + PRINT_END tail")
+        chain, near_chain = build_chain_script(
+            cache_3m,
+            [("Cube_1_id_1_copy_0", 10), ("Cube_1_id_0_copy_0", 10)],
+        )
+        if (
+            "X109.275" in script0
+            and near0
+            and "M25" in chain
+            and "PRINT_END" not in chain
+        ):
+            ok("script id_0 content", "front-left coords + batch M25 hold")
         else:
             fail("script id_0 content")
         if "X179.275" in script1 and not near1:
-            ok("script id_1 content", "back-right coords, no PRINT_END")
+            ok("script id_1 content", "back-right coords, no near-EOF flag")
         else:
             fail("script id_1 content")
         if "MOVE=0" in script0 and "MOVE=1" not in script0:

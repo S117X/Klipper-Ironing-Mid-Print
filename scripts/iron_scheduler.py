@@ -24,7 +24,9 @@ CACHE_VERSION = 9
 PRINT_END_MARGIN = 2000  # bytes: inject this close to PRINT_END runs PRINT_END after iron
 MIN_INJECT_MARGIN = 64  # bytes: refuse inject if sdcard is already this close to file end
 FAST_POLL_GAP = 8000  # bytes: tighten watcher polling when this close to a trigger
+EOF_POLL_GAP = 2000  # bytes: ultra-fast poll when SD is this close to PRINT_END
 FAST_POLL_INTERVAL = 0.08
+ULTRA_POLL_INTERVAL = 0.02
 
 CHANGE_LAYER_RE = re.compile(r"^;\s*(?:CHANGE_LAYER|LAYER_CHANGE)\b", re.I)
 Z_HEIGHT_RE = re.compile(r"^;\s*(?:Z_HEIGHT|Z):\s*([\d.]+)", re.I)
