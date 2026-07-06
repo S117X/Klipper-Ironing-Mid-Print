@@ -20,9 +20,11 @@ PRINTER_DATA = Path(os.environ.get("PRINTER_DATA", "/home/x/printer_data"))
 GCODE_DIR = PRINTER_DATA / "gcodes"
 CACHE_DIR = PRINTER_DATA / "iron_cache"
 MOONRAKER_URL = os.environ.get("MOONRAKER_URL", "http://127.0.0.1:7125")
-CACHE_VERSION = 6
+CACHE_VERSION = 9
 PRINT_END_MARGIN = 2000  # bytes: inject this close to PRINT_END runs PRINT_END after iron
-MIN_INJECT_MARGIN = 128  # bytes: refuse inject if sdcard is already this close to file end
+MIN_INJECT_MARGIN = 64  # bytes: refuse inject if sdcard is already this close to file end
+FAST_POLL_GAP = 8000  # bytes: tighten watcher polling when this close to a trigger
+FAST_POLL_INTERVAL = 0.08
 
 CHANGE_LAYER_RE = re.compile(r"^;\s*(?:CHANGE_LAYER|LAYER_CHANGE)\b", re.I)
 Z_HEIGHT_RE = re.compile(r"^;\s*(?:Z_HEIGHT|Z):\s*([\d.]+)", re.I)
@@ -43,7 +45,7 @@ EXCLUDE_END_RE = re.compile(r"^EXCLUDE_OBJECT_END\s+NAME=(?P<name>\S+)", re.I)
 STOP_PRINTING_RE = re.compile(r"^;\s*stop printing object\b", re.I)
 PRINT_END_LINE_RE = re.compile(r"^PRINT_END\b", re.I)
 G1_CMD_RE = re.compile(r"^G1\b", re.I)
-AXIS_RE = {axis: re.compile(rf"\b{axis}([\d.+-]+)", re.I) for axis in "XYZE"}
+AXIS_RE = {axis: re.compile(rf"\b{axis}([\d.+-]+)", re.I) for axis in "XYZEF"}
 
 
 def moonraker_get(path: str) -> dict[str, Any]:
@@ -162,7 +164,24 @@ def watcher_is_running(gcode_file: Path) -> bool:
 
 
 def start_watcher(gcode_file: Path) -> None:
+    lock = watcher_lock_path(gcode_file)
     if watcher_is_running(gcode_file):
+        return
+    acquired = False
+    for _ in range(5):
+        if watcher_is_running(gcode_file):
+            return
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.close(fd)
+            acquired = True
+            break
+        except FileExistsError:
+            if watcher_is_running(gcode_file):
+                return
+            lock.unlink(missing_ok=True)
+            time.sleep(0.05)
+    if not acquired:
         return
     watcher = Path(__file__).with_name("iron_watcher.py")
     proc = subprocess.Popen(
@@ -178,7 +197,7 @@ def start_watcher(gcode_file: Path) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    watcher_lock_path(gcode_file).write_text(str(proc.pid))
+    lock.write_text(str(proc.pid))
 
 
 TERMINAL_PRINT_STATES = frozenset({"complete", "cancelled", "error", "standby"})
@@ -257,15 +276,19 @@ def _apply_meta_kv(meta: dict[str, Any], key: str, value: str) -> None:
     elif key in ("ironing_flow", "support_ironing_flow"):
         meta["ironing_flow"] = float(value.rstrip("%")) / 100.0
     elif key == "ironing_speed":
-        meta["ironing_speed"] = float(value)
+        meta["ironing_speed"] = float(value.split()[0])
     elif key == "ironing_spacing":
-        meta["ironing_spacing"] = float(value)
+        meta["ironing_spacing"] = float(value.split()[0])
     elif key == "ironing_pattern":
         meta["ironing_pattern"] = value
     elif key == "ironing_angle":
-        meta["ironing_angle"] = float(value)
+        meta["ironing_angle"] = float(value.split()[0])
     elif key == "ironing_inset":
-        meta["ironing_inset"] = float(value)
+        meta["ironing_inset"] = float(value.split()[0])
+    elif key == "ironing_expansion":
+        meta["ironing_expansion"] = float(value.split()[0])
+    elif key == "ironing_fan_speed":
+        meta["ironing_fan_speed"] = float(value.split()[0])
     elif key == "layer_height":
         meta["layer_height"] = float(value)
     elif key == "filament_diameter":
@@ -283,11 +306,16 @@ def parse_metadata(lines: list[str]) -> dict[str, Any]:
         "ironing_pattern": "rectilinear",
         "ironing_angle": 0.0,
         "ironing_inset": 0.0,
+        "ironing_expansion": 0.0,
+        "ironing_fan_speed": -1.0,
         "layer_height": 0.2,
         "filament_diameter": 1.75,
         "line_width": 0.4,
         "iron_line_width": 0.40161,
         "iron_line_height": 0.0075,
+        "iron_velocity_limit": "SET_VELOCITY_LIMIT ACCEL=5000 ACCEL_TO_DECEL=2500",
+        "iron_travel_feed": 3600.0,
+        "iron_prime_feed": 1800.0,
     }
     in_config = False
     for line in lines:
@@ -295,26 +323,18 @@ def parse_metadata(lines: list[str]) -> dict[str, Any]:
         if "; CONFIG_BLOCK_START" in stripped:
             in_config = True
             continue
+        if not in_config:
+            continue
         if "; CONFIG_BLOCK_END" in stripped:
             break
         if not stripped.startswith(";"):
-            if not in_config:
-                break
             continue
         m = META_RE.match(stripped)
         if not m:
             continue
         key, value = m.group(1), m.group(2).strip()
-        if in_config or key in (
-            "top_shell_layers",
-            "ironing_flow",
-            "ironing_speed",
-            "ironing_spacing",
-            "layer_height",
-            "filament_diameter",
-            "line_width",
-        ):
-            _apply_meta_kv(meta, key, value)
+        _apply_meta_kv(meta, key, value)
+    meta["iron_travel_feed"] = float(meta["ironing_speed"]) * 60.0
     return meta
 
 
@@ -421,7 +441,49 @@ def e_per_mm(
     return (line_width * line_height / fil_area) * flow
 
 
+def extract_iron_approach_lines(recent: list[str]) -> list[str]:
+    """Orca approach block immediately before ;TYPE:Ironing (Z lift → prime → accel)."""
+    lines = [
+        s.strip()
+        for s in recent
+        if s.strip()
+        and not s.strip().startswith(";")
+        and not s.strip().startswith("M73")
+    ]
+    end_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].startswith("SET_VELOCITY_LIMIT ACCEL=5000 ACCEL_TO_DECEL=2500"):
+            end_idx = i
+            break
+    if end_idx is None:
+        return []
+
+    start_idx = end_idx
+    for i in range(end_idx, -1, -1):
+        s = lines[i]
+        if "E-" in s and s.startswith("G1"):
+            start_idx = i + 1
+            break
+        if s.startswith("G1 Z") and "F" in s:
+            start_idx = i
+            break
+    return lines[start_idx : end_idx + 1]
+
+
+def apply_iron_approach_feeds(meta: dict[str, Any], approach: list[str]) -> None:
+    for line in approach:
+        if line.startswith("G1 Z") and "F" in line:
+            m = re.search(r"\bF([\d.]+)", line, re.I)
+            if m:
+                meta["iron_travel_feed"] = float(m.group(1))
+        if line.startswith("G1 E") and "F" in line:
+            m = re.search(r"\bF([\d.]+)", line, re.I)
+            if m:
+                meta["iron_prime_feed"] = float(m.group(1))
+
+
 def clean_native_iron_lines(lines: list[str]) -> list[str]:
+    """Keep slicer ironing moves verbatim; stop at end-of-iron retract."""
     cleaned: list[str] = []
     for raw in lines:
         stripped = raw.strip()
@@ -429,14 +491,30 @@ def clean_native_iron_lines(lines: list[str]) -> list[str]:
             continue
         if stripped.startswith("M73"):
             continue
-        if stripped.startswith("SET_VELOCITY_LIMIT"):
-            continue
         if "WIPE_" in stripped:
-            continue
+            break
+        if stripped.startswith("EXCLUDE_OBJECT") or stripped.startswith("M106"):
+            break
+        if "E-" in stripped and stripped.startswith("G1"):
+            break
         cleaned.append(stripped)
+    while cleaned and cleaned[-1].startswith("G1 F") and "X" not in cleaned[-1]:
+        cleaned.pop()
     while cleaned and "E-" in cleaned[-1]:
         cleaned.pop()
     return cleaned
+
+
+def native_iron_header_lines(lines: list[str]) -> list[str]:
+    """Orca ;TYPE:Ironing header comments from native feature."""
+    header: list[str] = []
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped.startswith(";TYPE:Ironing") or stripped.startswith(";WIDTH:") or stripped.startswith(
+            ";HEIGHT:"
+        ):
+            header.append(stripped)
+    return header
 
 
 def iron_approach_preamble(
@@ -445,27 +523,60 @@ def iron_approach_preamble(
     line_width: float,
     line_height: float,
     inset: float,
+    meta: dict[str, Any] | None = None,
+    native_header: list[str] | None = None,
 ) -> list[str]:
+    meta = meta or {}
+    travel = float(meta.get("iron_travel_feed") or 3600.0)
+    prime = float(meta.get("iron_prime_feed") or 1800.0)
+    vel = str(
+        meta.get("iron_velocity_limit")
+        or "SET_VELOCITY_LIMIT ACCEL=5000 ACCEL_TO_DECEL=2500"
+    )
     ix0, iy0, ix1, iy1 = iron_surface_rect(polygon, inset)
     z_lift = z + 0.4
     corner_x = ix1
     corner_y = iy0 - 0.067
+    header = native_header or [
+        ";TYPE:Ironing",
+        f";WIDTH:{line_width:.5f}",
+        f";HEIGHT:{line_height:.5f}",
+    ]
     return [
         "; --- slicer-style iron approach ---",
         "G90",
-        f"G1 Z{z_lift:.2f} F3600",
+        f"G1 Z{z_lift:.2f} F{travel:.0f}",
         f"G1 X{ix0:.3f} Y{(iy0 + iy1) / 2:.3f} Z{z_lift:.2f}",
         f"G1 X{ix0:.3f} Y{iy1:.3f}",
         f"G1 X{ix1:.3f} Y{iy1:.3f}",
         f"G1 X{ix1:.3f} Y{iy0:.3f}",
         f"G1 X{corner_x:.3f} Y{corner_y:.3f}",
         f"G1 Z{z:.2f}",
-        "G1 E.8 F1800",
-        "SET_VELOCITY_LIMIT ACCEL=5000 ACCEL_TO_DECEL=2500",
-        ";TYPE:Ironing",
-        f";WIDTH:{line_width:.5f}",
-        f";HEIGHT:{line_height:.5f}",
+        f"G1 E.8 F{prime:.0f}",
+        vel,
+        *header,
     ]
+
+
+def translate_gcode_lines(
+    lines: list[str],
+    dx: float,
+    dy: float,
+) -> list[str]:
+    out: list[str] = []
+    for raw in lines:
+        if raw.startswith("SET_VELOCITY_LIMIT"):
+            out.append(raw)
+            continue
+        coords = parse_g1_line(raw)
+        if not coords:
+            continue
+        if "x" in coords:
+            coords["x"] += dx
+        if "y" in coords:
+            coords["y"] += dy
+        out.append(format_g1_move(coords))
+    return out
 
 
 def translate_iron_template(
@@ -474,6 +585,8 @@ def translate_iron_template(
     polygon: list[list[float]],
     z: float,
     meta: dict[str, Any],
+    approach_lines: list[str] | None = None,
+    header_lines: list[str] | None = None,
 ) -> list[str]:
     """Shift a native Orca ironing path to another same-size object."""
     inset = float(meta.get("ironing_inset", 0.0))
@@ -483,22 +596,29 @@ def translate_iron_template(
     dx = dst_rect[0] - src_rect[0]
     dy = dst_rect[1] - src_rect[1]
 
-    moves: list[str] = []
-    for raw in template_moves:
-        coords = parse_g1_line(raw)
-        if not coords:
-            continue
-        if "x" in coords:
-            coords["x"] += dx
-        if "y" in coords:
-            coords["y"] += dy
-        moves.append(format_g1_move(coords))
-
+    moves = translate_gcode_lines(template_moves, dx, dy)
     if not moves:
         return []
+
+    header = header_lines or [
+        ";TYPE:Ironing",
+        f";WIDTH:{line_width:.5f}",
+        f";HEIGHT:{line_height:.5f}",
+    ]
+    if approach_lines:
+        approach = translate_gcode_lines(approach_lines, dx, dy)
+        return [
+            "; --- orca slicer iron (matched) ---",
+            "G90",
+            *approach,
+            *header,
+            *moves,
+        ]
     return [
         "; --- orca template iron (translated) ---",
-        *iron_approach_preamble(polygon, z, line_width, line_height, inset),
+        *iron_approach_preamble(
+            polygon, z, line_width, line_height, inset, meta=meta
+        ),
         *moves,
     ]
 
@@ -507,12 +627,26 @@ def generate_rectilinear_iron(
     polygon: list[list[float]],
     z: float,
     meta: dict[str, Any],
-    template: tuple[list[str], tuple[float, float, float, float]] | None = None,
+    template: (
+        tuple[
+            list[str],
+            tuple[float, float, float, float],
+            list[str],
+            list[str],
+        ]
+        | None
+    ) = None,
 ) -> list[str]:
     if template:
-        template_moves, src_rect = template
+        template_moves, src_rect, approach_lines, header_lines = template
         translated = translate_iron_template(
-            template_moves, src_rect, polygon, z, meta
+            template_moves,
+            src_rect,
+            polygon,
+            z,
+            meta,
+            approach_lines=approach_lines or None,
+            header_lines=header_lines or None,
         )
         if translated:
             return translated
@@ -540,7 +674,9 @@ def generate_rectilinear_iron(
         return []
     return [
         "; --- rectilinear iron fallback ---",
-        *iron_approach_preamble(polygon, z, line_width, line_height, inset),
+        *iron_approach_preamble(
+            polygon, z, line_width, line_height, inset, meta=meta
+        ),
         *moves,
     ]
 
@@ -550,6 +686,7 @@ def wrap_slicer_iron(
     polygon: list[list[float]],
     z: float,
     meta: dict[str, Any],
+    approach_lines: list[str] | None = None,
 ) -> list[str]:
     cleaned = clean_native_iron_lines(native_lines)
     if not cleaned:
@@ -557,8 +694,25 @@ def wrap_slicer_iron(
     line_width = float(meta.get("iron_line_width", meta["line_width"]))
     line_height = float(meta.get("iron_line_height", 0.0075))
     inset = float(meta.get("ironing_inset", 0.0))
+    header = native_iron_header_lines(native_lines)
+    if approach_lines:
+        return [
+            "; --- orca slicer iron (native) ---",
+            "G90",
+            *approach_lines,
+            *header,
+            *cleaned,
+        ]
     return [
-        *iron_approach_preamble(polygon, z, line_width, line_height, inset),
+        *iron_approach_preamble(
+            polygon,
+            z,
+            line_width,
+            line_height,
+            inset,
+            meta=meta,
+            native_header=header,
+        ),
         *cleaned,
     ]
 
@@ -660,6 +814,8 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
     object_layer_end_byte: dict[str, dict[str, int]] = {}
     object_top_surface_end_byte: dict[str, dict[str, int]] = {}
     object_had_top_surface: dict[str, bool] = {}
+    object_recent_gcode: dict[str, list[str]] = {}
+    object_iron_approach: dict[str, dict[str, list[str]]] = {}
     print_end_byte: int | None = None
 
     def flush_feature() -> None:
@@ -722,7 +878,7 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
             continue
 
         if PRINT_END_LINE_RE.match(stripped):
-            print_end_byte = file_offset + line_byte_len
+            print_end_byte = file_offset
 
         if (
             current_object
@@ -788,8 +944,26 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
             feature = feat_match.group(1).strip()
             if current_object and feature.casefold() == "top surface":
                 object_had_top_surface[current_object] = True
+            if (
+                current_object
+                and layer_num > 0
+                and feature.casefold() == "ironing"
+            ):
+                approach = extract_iron_approach_lines(
+                    object_recent_gcode.get(current_object, [])
+                )
+                if approach:
+                    object_iron_approach.setdefault(current_object, {})[
+                        str(layer_num)
+                    ] = approach
             file_offset += line_byte_len
             continue
+
+        if current_object and stripped and not stripped.startswith(";"):
+            bucket = object_recent_gcode.setdefault(current_object, [])
+            bucket.append(stripped)
+            if len(bucket) > 28:
+                object_recent_gcode[current_object] = bucket[-28:]
 
         if feature == "Ironing":
             w_match = IRON_WIDTH_RE.match(stripped)
@@ -812,19 +986,52 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
         total_layers, total_layers * layer_height
     )
 
-    iron_template: tuple[list[str], tuple[float, float, float, float]] | None = None
+    iron_template: (
+        tuple[
+            list[str],
+            tuple[float, float, float, float],
+            list[str],
+            list[str],
+        ]
+        | None
+    ) = None
+    template_source: str | None = None
+    template_layer: str | None = None
     template_inset = float(meta.get("ironing_inset", 0.0))
     for obj_name, obj in objects.items():
         polygon = obj.get("polygon")
         if not polygon:
             continue
-        for feats in object_features.get(obj_name, {}).values():
+        for layer_key, feats in object_features.get(obj_name, {}).items():
             native = feats.get("Ironing", [])
             if not native:
                 continue
+            header = native_iron_header_lines(native)
+            for hdr in header:
+                if hdr.startswith(";WIDTH:"):
+                    meta["iron_line_width"] = float(hdr.split(":", 1)[1])
+                elif hdr.startswith(";HEIGHT:"):
+                    meta["iron_line_height"] = float(hdr.split(":", 1)[1])
+            approach = object_iron_approach.get(obj_name, {}).get(layer_key, [])
+            apply_iron_approach_feeds(meta, approach)
+            for raw in native:
+                s = raw.strip()
+                if s.startswith("SET_VELOCITY_LIMIT"):
+                    meta["iron_velocity_limit"] = s
+            for raw in approach:
+                s = raw.strip()
+                if s.startswith("SET_VELOCITY_LIMIT"):
+                    meta["iron_velocity_limit"] = s
             cleaned = clean_native_iron_lines(native)
             if cleaned:
-                iron_template = (cleaned, iron_surface_rect(polygon, template_inset))
+                iron_template = (
+                    cleaned,
+                    iron_surface_rect(polygon, template_inset),
+                    approach,
+                    header,
+                )
+                template_source = obj_name
+                template_layer = layer_key
                 break
         if iron_template:
             break
@@ -842,8 +1049,13 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
                 continue
             has_slicer = True
             z = layer_z_by_num.get(layer_i, top_layer_z)
+            approach = object_iron_approach.get(obj_name, {}).get(layer_key, [])
+            if approach:
+                apply_iron_approach_feeds(meta, approach)
             if polygon:
-                iron_lines = wrap_slicer_iron(native, polygon, z, meta)
+                iron_lines = wrap_slicer_iron(
+                    native, polygon, z, meta, approach_lines=approach or None
+                )
             else:
                 iron_lines = clean_native_iron_lines(native)
             snippet = "\n".join(iron_lines)
@@ -889,8 +1101,20 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
         "speed": meta["ironing_speed"],
         "spacing": meta["ironing_spacing"],
         "pattern": meta["ironing_pattern"],
+        "angle": meta.get("ironing_angle"),
+        "inset": meta.get("ironing_inset"),
+        "expansion": meta.get("ironing_expansion"),
+        "fan_speed": meta.get("ironing_fan_speed"),
         "line_width": meta.get("iron_line_width"),
         "line_height": meta.get("iron_line_height"),
+        "travel_feed": meta.get("iron_travel_feed"),
+        "prime_feed": meta.get("iron_prime_feed"),
+        "velocity_limit": meta.get("iron_velocity_limit"),
+        "template_source": template_source,
+        "template_layer": template_layer,
+        "uses_native_approach": bool(
+            iron_template and iron_template[2]
+        ),
     }
 
     cache = {
@@ -1012,7 +1236,10 @@ def cmd_enable(args: argparse.Namespace) -> int:
     if obj.get("has_slicer_iron"):
         result = {
             "ok": False,
-            "error": "Object already has slicer ironing in this file",
+            "error": (
+                "Object already has slicer ironing in this file — Orca will iron "
+                "it during the normal print. Only schedule the other object(s)."
+            ),
         }
         report_enable_result(result)
         print(json.dumps(result))

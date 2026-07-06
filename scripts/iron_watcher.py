@@ -6,8 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -20,7 +20,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import inject_iron  # noqa: E402
+
 from iron_scheduler import (  # noqa: E402
+    FAST_POLL_INTERVAL,
     cleanup_watcher_artifacts,
     normalize_schedule,
     print_job_active,
@@ -113,6 +116,56 @@ def inject_after_byte(cache: dict, object_name: str, layer: int) -> int | None:
     return None
 
 
+def pending_inject_targets(
+    cache: dict,
+    schedule: dict,
+    layer: int,
+    file_pos: int,
+    failed_logged: set[tuple[str, int]],
+) -> tuple[list[tuple[int, str, int]], list[tuple[int, str, int]]]:
+    """Return (waiting_for_trigger, ready_now) sorted by gcode byte order."""
+    waiting: list[tuple[int, str, int]] = []
+    ready: list[tuple[int, str, int]] = []
+
+    for obj_name, obj_sched in (schedule.get("objects") or {}).items():
+        done = set(obj_sched.get("done") or [])
+        for target in obj_sched.get("layers") or []:
+            if target in done or layer < target:
+                continue
+            wait_key = (obj_name, target)
+            if wait_key in failed_logged:
+                continue
+            trigger_byte = inject_after_byte(cache, obj_name, target)
+            if trigger_byte is None:
+                ready.append((0, obj_name, target))
+                continue
+            entry = (int(trigger_byte), obj_name, target)
+            if file_pos < int(trigger_byte):
+                waiting.append(entry)
+            else:
+                ready.append(entry)
+
+    waiting.sort(key=lambda item: item[0])
+    ready.sort(key=lambda item: item[0])
+    return waiting, ready
+
+
+def schedule_has_pending_iron(schedule: dict, layer: int) -> bool:
+    for obj_sched in (schedule.get("objects") or {}).values():
+        done = set(obj_sched.get("done") or [])
+        for target in obj_sched.get("layers") or []:
+            if target not in done and layer >= target:
+                return True
+    return False
+
+
+def poll_interval(schedule: dict, layer: int, inflight: set[tuple[str, int]]) -> float:
+    """Fast poll while injects are outstanding or in-flight."""
+    if inflight or schedule_has_pending_iron(schedule, layer):
+        return FAST_POLL_INTERVAL
+    return 1.5
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--file", required=True)
@@ -121,8 +174,6 @@ def main() -> int:
 
     schedule_path = Path(args.schedule)
     gcode_file = Path(args.file)
-    inject = Path(__file__).with_name("inject_iron.py")
-    cache = load_cache(gcode_file)
     log_path = CACHE_DIR / "iron_watcher.log"
 
     def log(msg: str) -> None:
@@ -150,7 +201,8 @@ def main() -> int:
 
     log(
         f"watcher started file={gcode_file.name} "
-        f"objects={list((initial.get('objects') or {}).keys())}"
+        f"objects={list((initial.get('objects') or {}).keys())} "
+        f"mode=async_immediate_inject"
     )
 
     seen_printing = False
@@ -172,6 +224,132 @@ def main() -> int:
     stale_layer_polls = 0
     waiting_logged: set[tuple[str, int]] = set()
     failed_logged: set[tuple[str, int]] = set()
+    inflight: set[tuple[str, int]] = set()
+    launched: set[tuple[str, int]] = set()
+    session_done: set[tuple[str, int]] = set()
+    inflight_lock = threading.Lock()
+    schedule_lock = threading.Lock()
+
+    def claim_inject_target(obj_name: str, target: int) -> bool:
+        """Persist launching on disk so duplicate watchers cannot double-inject."""
+        wait_key = (obj_name, target)
+        with schedule_lock:
+            try:
+                schedule = normalize_schedule(json.loads(schedule_path.read_text()))
+            except (json.JSONDecodeError, OSError):
+                return False
+            obj_sched = schedule.get("objects", {}).get(obj_name)
+            if not obj_sched:
+                return False
+            done = set(obj_sched.get("done") or [])
+            launching = set(obj_sched.get("launching") or [])
+            if target in done or target in launching:
+                return False
+            launching.add(target)
+            obj_sched["launching"] = sorted(launching)
+            schedule["objects"][obj_name] = obj_sched
+            schedule_path.write_text(json.dumps(schedule, indent=2))
+        with inflight_lock:
+            launched.add(wait_key)
+            inflight.add(wait_key)
+        return True
+
+    def mark_inject_done(
+        wait_key: tuple[str, int],
+        obj_name: str,
+        target: int,
+        rc: int,
+        err: str,
+    ) -> None:
+        with schedule_lock:
+            try:
+                schedule = normalize_schedule(json.loads(schedule_path.read_text()))
+            except (json.JSONDecodeError, OSError):
+                schedule = None
+            if schedule is not None:
+                obj_sched = schedule.get("objects", {}).get(obj_name)
+                if obj_sched:
+                    launching = [
+                        layer
+                        for layer in (obj_sched.get("launching") or [])
+                        if layer != target
+                    ]
+                    obj_sched["launching"] = launching
+                    schedule["objects"][obj_name] = obj_sched
+                    schedule_path.write_text(json.dumps(schedule, indent=2))
+
+        with inflight_lock:
+            inflight.discard(wait_key)
+
+        if rc != 0:
+            if len(err) > 400:
+                err = err[:400] + "..."
+            failed_logged.add(wait_key)
+            log(f"inject failed object={obj_name} layer={target}: {err}")
+            return
+
+        status = get_print_status()
+        ps = status.get("print_stats", {})
+        if str(ps.get("state") or "") == "complete":
+            failed_logged.add(wait_key)
+            log(
+                f"inject suspect object={obj_name} layer={target}: "
+                "print already complete"
+            )
+            return
+
+        with schedule_lock:
+            try:
+                schedule = normalize_schedule(json.loads(schedule_path.read_text()))
+            except (json.JSONDecodeError, OSError):
+                return
+            obj_sched = schedule.get("objects", {}).get(obj_name)
+            if not obj_sched:
+                return
+            done = list(obj_sched.get("done") or [])
+            if target not in done:
+                done.append(target)
+            obj_sched["done"] = done
+            obj_sched["launching"] = [
+                layer
+                for layer in (obj_sched.get("launching") or [])
+                if layer != target
+            ]
+            schedule["objects"][obj_name] = obj_sched
+            schedule_path.write_text(json.dumps(schedule, indent=2))
+        with inflight_lock:
+            session_done.add(wait_key)
+        waiting_logged.discard(wait_key)
+        log(f"inject ok object={obj_name} layer={target}")
+
+    def start_inject_async(
+        obj_name: str,
+        target: int,
+        trigger_byte: int,
+        layer: int,
+        file_pos: int,
+    ) -> None:
+        wait_key = (obj_name, target)
+
+        def worker() -> None:
+            try:
+                inject_iron.inject_object(
+                    gcode_file.name, obj_name, target, trigger_byte=trigger_byte
+                )
+                rc = 0
+                err = ""
+            except SystemExit as exc:
+                rc = int(exc.code) if isinstance(exc.code, int) else 1
+                err = str(exc)
+            mark_inject_done(wait_key, obj_name, target, rc, err)
+
+        log(
+            f"inject {gcode_file.name} object={obj_name} layer={target} "
+            f"(detected_layer={layer} file_pos={file_pos} "
+            f"trigger_byte={trigger_byte})"
+        )
+        threading.Thread(target=worker, daemon=True, name=f"iron-{obj_name}").start()
+
     try:
         while True:
             status = get_print_status()
@@ -199,6 +377,11 @@ def main() -> int:
                 time.sleep(1.5)
                 continue
 
+            cache = load_cache(gcode_file)
+            if not cache:
+                time.sleep(1.5)
+                continue
+
             layer = get_current_layer(cache, status)
             file_pos = get_file_position(status)
             if layer != last_logged_layer and layer > 0:
@@ -219,40 +402,25 @@ def main() -> int:
                         f"file_pos={vsd.get('file_position')}"
                     )
 
-            ready: list[tuple[int, str, int]] = []
-            waiting: list[tuple[str, int, int]] = []
-            for obj_name, obj_sched in (schedule.get("objects") or {}).items():
-                done = list(obj_sched.get("done") or [])
-                for target in obj_sched.get("layers") or []:
-                    if target in done:
-                        continue
-                    if layer < target:
-                        continue
-                    wait_key = (obj_name, target)
-                    trigger_byte = inject_after_byte(cache, obj_name, target)
-                    if trigger_byte is not None and file_pos < trigger_byte:
-                        waiting.append((trigger_byte, obj_name, target))
-                        if wait_key not in waiting_logged:
-                            log(
-                                f"waiting top surface file={gcode_file.name} "
-                                f"object={obj_name} layer={target} "
-                                f"file_pos={file_pos} need_byte={trigger_byte}"
-                            )
-                            waiting_logged.add(wait_key)
-                        continue
-                    if wait_key in failed_logged:
-                        continue
-                    ready.append((trigger_byte or 0, obj_name, target))
+            waiting, ready = pending_inject_targets(
+                cache, schedule, layer, file_pos, failed_logged
+            )
 
-            ready.sort(key=lambda item: item[0])
             for trigger_byte, obj_name, target in waiting:
-                waiting_logged.add((obj_name, target))
-
-            changed = False
-            if ready:
-                trigger_byte, obj_name, target = ready[0]
                 wait_key = (obj_name, target)
+                if wait_key not in waiting_logged:
+                    log(
+                        f"waiting top surface file={gcode_file.name} "
+                        f"object={obj_name} layer={target} "
+                        f"file_pos={file_pos} need_byte={trigger_byte}"
+                    )
+                    waiting_logged.add(wait_key)
 
+            launched_this_loop = False
+            # Fire inject as soon as file_pos passes each object's trigger.
+            # Non-blocking: SD keeps advancing while Klipper runs iron, so the
+            # watcher must keep polling and queue the next object immediately.
+            if ready:
                 status = get_print_status()
                 finished, reason = print_job_finished(
                     status, gcode_file, seen_printing=seen_printing
@@ -262,92 +430,74 @@ def main() -> int:
                     return 0
 
                 if not print_job_active(status):
-                    log(
-                        f"inject skipped object={obj_name} layer={target}: "
-                        "print not active"
-                    )
-                    failed_logged.add(wait_key)
-                else:
-                    log(
-                        f"inject {gcode_file.name} object={obj_name} layer={target} "
-                        f"(detected_layer={layer} file_pos={file_pos} "
-                        f"trigger_byte={trigger_byte})"
-                    )
-                    proc = subprocess.run(
-                        [
-                            sys.executable,
-                            str(inject),
-                            "--file",
-                            str(gcode_file),
-                            "--object",
-                            obj_name,
-                            "--layer",
-                            str(target),
-                        ],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-                    obj_sched = schedule["objects"][obj_name]
-                    done = list(obj_sched.get("done") or [])
-                    if proc.returncode == 0:
-                        status = get_print_status()
-                        ps = status.get("print_stats", {})
-                        if str(ps.get("state") or "") == "complete":
-                            err = (
-                                "inject returned ok but print already complete "
-                                "(iron may not have run)"
-                            )
-                            failed_logged.add(wait_key)
-                            log(f"inject suspect object={obj_name} layer={target}: {err}")
-                        else:
-                            if target not in done:
-                                done.append(target)
-                            obj_sched["done"] = done
-                            schedule["objects"][obj_name] = obj_sched
-                            changed = True
-                            waiting_logged.discard(wait_key)
-                            log(f"inject ok object={obj_name} layer={target}")
-                    else:
-                        err = (proc.stderr or proc.stdout or "unknown error").strip()
-                        if len(err) > 400:
-                            err = err[:400] + "..."
+                    for _, obj_name, target in ready:
+                        wait_key = (obj_name, target)
+                        log(
+                            f"inject skipped object={obj_name} layer={target}: "
+                            "print not active"
+                        )
                         failed_logged.add(wait_key)
-                        log(f"inject failed object={obj_name} layer={target}: {err}")
+                else:
+                    file_pos = get_file_position(status)
+                    for trigger_byte, obj_name, target in ready:
+                        wait_key = (obj_name, target)
+                        if wait_key in failed_logged or wait_key in session_done:
+                            continue
+                        obj_sched = schedule.get("objects", {}).get(obj_name) or {}
+                        if target in (obj_sched.get("done") or []):
+                            with inflight_lock:
+                                session_done.add(wait_key)
+                            continue
+                        if target in (obj_sched.get("launching") or []):
+                            continue
+                        with inflight_lock:
+                            if wait_key in inflight or wait_key in launched:
+                                continue
+                        if not claim_inject_target(obj_name, target):
+                            continue
+                        start_inject_async(
+                            obj_name, target, trigger_byte, layer, file_pos
+                        )
+                        launched_this_loop = True
 
-                    finished, reason = print_job_finished(
-                        get_print_status(), gcode_file, seen_printing=seen_printing
+            with schedule_lock:
+                try:
+                    schedule = normalize_schedule(
+                        json.loads(schedule_path.read_text())
                     )
-                    if finished and "complete" in reason:
-                        # Near-EOF inject appends PRINT_END; give homing time to finish.
-                        for _ in range(45):
-                            try:
-                                resp = moonraker_get(
-                                    "/printer/objects/query?toolhead"
-                                )
-                                th = resp.get("result", {}).get("status", {}).get(
-                                    "toolhead", {}
-                                )
-                                homed = str(th.get("homed_axes") or "")
-                                if "x" in homed and "y" in homed:
-                                    break
-                            except (urllib.error.URLError, json.JSONDecodeError, KeyError):
-                                pass
-                            time.sleep(1.0)
-                        stop_watching(f"after_inject {reason}")
-                        return 0
-                    if finished:
-                        stop_watching(f"after_inject {reason}")
-                        return 0
+                except (json.JSONDecodeError, OSError):
+                    schedule = {"objects": {}}
 
-            if changed:
-                schedule_path.write_text(json.dumps(schedule, indent=2))
-
-            if schedule_all_complete(schedule):
+            if schedule_all_complete(schedule) and not inflight:
                 schedule["active"] = False
                 schedule_path.write_text(json.dumps(schedule, indent=2))
 
-            time.sleep(1.5)
+            finished, reason = print_job_finished(
+                get_print_status(), gcode_file, seen_printing=seen_printing
+            )
+            if finished and "complete" in reason and not inflight:
+                for _ in range(45):
+                    try:
+                        resp = moonraker_get("/printer/objects/query?toolhead")
+                        th = resp.get("result", {}).get("status", {}).get(
+                            "toolhead", {}
+                        )
+                        homed = str(th.get("homed_axes") or "")
+                        if "x" in homed and "y" in homed:
+                            break
+                    except (urllib.error.URLError, json.JSONDecodeError, KeyError):
+                        pass
+                    time.sleep(1.0)
+                stop_watching(f"after_inject {reason}")
+                return 0
+            if finished and not inflight:
+                stop_watching(f"after_inject {reason}")
+                return 0
+
+            if launched_this_loop or inflight:
+                continue
+
+            time.sleep(poll_interval(schedule, layer, inflight))
     finally:
         lock_path.unlink(missing_ok=True)
 
