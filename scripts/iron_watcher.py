@@ -291,13 +291,23 @@ def main() -> int:
                     obj_sched = schedule["objects"][obj_name]
                     done = list(obj_sched.get("done") or [])
                     if proc.returncode == 0:
-                        if target not in done:
-                            done.append(target)
-                        obj_sched["done"] = done
-                        schedule["objects"][obj_name] = obj_sched
-                        changed = True
-                        waiting_logged.discard(wait_key)
-                        log(f"inject ok object={obj_name} layer={target}")
+                        status = get_print_status()
+                        ps = status.get("print_stats", {})
+                        if str(ps.get("state") or "") == "complete":
+                            err = (
+                                "inject returned ok but print already complete "
+                                "(iron may not have run)"
+                            )
+                            failed_logged.add(wait_key)
+                            log(f"inject suspect object={obj_name} layer={target}: {err}")
+                        else:
+                            if target not in done:
+                                done.append(target)
+                            obj_sched["done"] = done
+                            schedule["objects"][obj_name] = obj_sched
+                            changed = True
+                            waiting_logged.discard(wait_key)
+                            log(f"inject ok object={obj_name} layer={target}")
                     else:
                         err = (proc.stderr or proc.stdout or "unknown error").strip()
                         if len(err) > 400:
@@ -308,6 +318,24 @@ def main() -> int:
                     finished, reason = print_job_finished(
                         get_print_status(), gcode_file, seen_printing=seen_printing
                     )
+                    if finished and "complete" in reason:
+                        # Near-EOF inject appends PRINT_END; give homing time to finish.
+                        for _ in range(45):
+                            try:
+                                resp = moonraker_get(
+                                    "/printer/objects/query?toolhead"
+                                )
+                                th = resp.get("result", {}).get("status", {}).get(
+                                    "toolhead", {}
+                                )
+                                homed = str(th.get("homed_axes") or "")
+                                if "x" in homed and "y" in homed:
+                                    break
+                            except (urllib.error.URLError, json.JSONDecodeError, KeyError):
+                                pass
+                            time.sleep(1.0)
+                        stop_watching(f"after_inject {reason}")
+                        return 0
                     if finished:
                         stop_watching(f"after_inject {reason}")
                         return 0

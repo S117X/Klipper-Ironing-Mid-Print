@@ -20,7 +20,9 @@ PRINTER_DATA = Path(os.environ.get("PRINTER_DATA", "/home/x/printer_data"))
 GCODE_DIR = PRINTER_DATA / "gcodes"
 CACHE_DIR = PRINTER_DATA / "iron_cache"
 MOONRAKER_URL = os.environ.get("MOONRAKER_URL", "http://127.0.0.1:7125")
-CACHE_VERSION = 5
+CACHE_VERSION = 6
+PRINT_END_MARGIN = 2000  # bytes: inject this close to PRINT_END runs PRINT_END after iron
+MIN_INJECT_MARGIN = 128  # bytes: refuse inject if sdcard is already this close to file end
 
 CHANGE_LAYER_RE = re.compile(r"^;\s*(?:CHANGE_LAYER|LAYER_CHANGE)\b", re.I)
 Z_HEIGHT_RE = re.compile(r"^;\s*(?:Z_HEIGHT|Z):\s*([\d.]+)", re.I)
@@ -38,6 +40,8 @@ EXCLUDE_DEFINE_RE = re.compile(
 )
 EXCLUDE_START_RE = re.compile(r"^EXCLUDE_OBJECT_START\s+NAME=(?P<name>\S+)", re.I)
 EXCLUDE_END_RE = re.compile(r"^EXCLUDE_OBJECT_END\s+NAME=(?P<name>\S+)", re.I)
+STOP_PRINTING_RE = re.compile(r"^;\s*stop printing object\b", re.I)
+PRINT_END_LINE_RE = re.compile(r"^PRINT_END\b", re.I)
 G1_CMD_RE = re.compile(r"^G1\b", re.I)
 AXIS_RE = {axis: re.compile(rf"\b{axis}([\d.+-]+)", re.I) for axis in "XYZE"}
 
@@ -656,6 +660,7 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
     object_layer_end_byte: dict[str, dict[str, int]] = {}
     object_top_surface_end_byte: dict[str, dict[str, int]] = {}
     object_had_top_surface: dict[str, bool] = {}
+    print_end_byte: int | None = None
 
     def flush_feature() -> None:
         nonlocal feature, feature_lines
@@ -716,19 +721,34 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
             file_offset += line_byte_len
             continue
 
+        if PRINT_END_LINE_RE.match(stripped):
+            print_end_byte = file_offset + line_byte_len
+
+        if (
+            current_object
+            and layer_num > 0
+            and object_had_top_surface.get(current_object)
+            and STOP_PRINTING_RE.match(stripped)
+        ):
+            # Inject after the last top-surface extrusion, before wipe/end gcode.
+            object_top_surface_end_byte.setdefault(current_object, {})[
+                str(layer_num)
+            ] = file_offset + line_byte_len
+
         end = EXCLUDE_END_RE.match(stripped)
         if end:
             flush_feature()
             ended_obj = end.group("name")
             if layer_num > 0:
-                end_byte = file_offset + len(line) + 1
+                end_byte = file_offset + line_byte_len
                 object_layer_end_byte.setdefault(ended_obj, {})[
                     str(layer_num)
                 ] = end_byte
                 if object_had_top_surface.get(ended_obj):
-                    object_top_surface_end_byte.setdefault(ended_obj, {})[
-                        str(layer_num)
-                    ] = end_byte
+                    top_bucket = object_top_surface_end_byte.setdefault(
+                        ended_obj, {}
+                    )
+                    top_bucket.setdefault(str(layer_num), end_byte)
             object_had_top_surface.pop(ended_obj, None)
             current_object = None
             file_offset += line_byte_len
@@ -843,6 +863,7 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
                 )
 
         inject_after_byte: dict[str, int] = {}
+        inject_near_print_end: dict[str, bool] = {}
         for layer_key in obj_layers:
             if layer_key in object_top_surface_end_byte.get(obj_name, {}):
                 inject_after_byte[layer_key] = object_top_surface_end_byte[
@@ -852,11 +873,16 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
                 inject_after_byte[layer_key] = object_layer_end_byte[obj_name][
                     layer_key
                 ]
+            if print_end_byte is not None and layer_key in inject_after_byte:
+                margin = print_end_byte - inject_after_byte[layer_key]
+                inject_near_print_end[layer_key] = margin <= PRINT_END_MARGIN
 
         obj["layers"] = obj_layers
         obj["layer_sources"] = layer_sources
         obj["has_slicer_iron"] = has_slicer
         obj["inject_after_byte"] = inject_after_byte
+        if inject_near_print_end:
+            obj["inject_near_print_end"] = inject_near_print_end
 
     ironing_settings = {
         "flow": meta["ironing_flow"],
@@ -870,6 +896,9 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
     cache = {
         "file": gcode_file.name,
         "cache_version": CACHE_VERSION,
+        "print_end_byte": print_end_byte,
+        "print_end_margin": PRINT_END_MARGIN,
+        "min_inject_margin": MIN_INJECT_MARGIN,
         "total_layers": total_layers,
         "layer_height": layer_height,
         "layer_byte_offsets": layer_byte_offsets,

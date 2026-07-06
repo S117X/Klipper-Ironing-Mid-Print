@@ -36,6 +36,20 @@ def print_state() -> str:
         return ""
 
 
+def file_position() -> int:
+    try:
+        resp = moonraker_get("/printer/objects/query?virtual_sdcard")
+        return int(
+            resp.get("result", {})
+            .get("status", {})
+            .get("virtual_sdcard", {})
+            .get("file_position")
+            or 0
+        )
+    except (urllib.error.URLError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return 0
+
+
 def moonraker_script(script: str) -> None:
     payload = json.dumps({"script": script}).encode()
     req = urllib.request.Request(
@@ -78,6 +92,26 @@ def main() -> int:
     if not snippet:
         raise SystemExit(f"No iron gcode for layer {args.layer}")
 
+    print_end_byte = cache.get("print_end_byte")
+    min_margin = int(cache.get("min_inject_margin") or 128)
+    print_end_margin = int(cache.get("print_end_margin") or 2000)
+    trigger_byte = (obj.get("inject_after_byte") or {}).get(str(args.layer))
+    file_pos = file_position()
+
+    if print_end_byte is not None:
+        room = int(print_end_byte) - file_pos
+        if room < min_margin:
+            raise SystemExit(
+                f"Refusing iron inject: file_pos={file_pos} only {room} bytes "
+                f"before PRINT_END at {print_end_byte}"
+            )
+
+    near_print_end = bool(
+        (obj.get("inject_near_print_end") or {}).get(str(args.layer))
+    )
+    if not near_print_end and print_end_byte is not None and trigger_byte is not None:
+        near_print_end = int(print_end_byte) - int(trigger_byte) <= print_end_margin
+
     script_lines = [
         f"; IRON object={args.object} layer={args.layer}",
         "SAVE_GCODE_STATE NAME=IRON_STATE",
@@ -89,6 +123,8 @@ def main() -> int:
     # MOVE=0: restore coords/feedrate but do NOT jump back to the saved
     # toolhead position (MOVE=1 caused back-and-forth between objects).
     script_lines.append("RESTORE_GCODE_STATE NAME=IRON_STATE MOVE=0")
+    if near_print_end:
+        script_lines.append("PRINT_END")
     moonraker_script("\n".join(script_lines) + "\n")
     return 0
 
