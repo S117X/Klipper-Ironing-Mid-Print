@@ -22,7 +22,8 @@
         pending: new Map(),
         busy: false,
         connected: false,
-        scheduledObject: null,
+        scheduleByObject: {},
+        scheduleActive: false,
         ironCache: {},
         ironingSettings: null,
       };
@@ -191,17 +192,39 @@
       return ["printing", "paused"].includes(this.state.printState);
     }
 
-    isScheduled(name) {
-      if (!name || !this.state.scheduledObject) return false;
-      return name.toLowerCase() === this.state.scheduledObject.toLowerCase();
+    getScheduleEntry(name) {
+      if (!name) return null;
+      const exact = this.state.scheduleByObject[name];
+      if (exact) return exact;
+      const key = Object.keys(this.state.scheduleByObject).find(
+        (k) => k.toLowerCase() === name.toLowerCase()
+      );
+      return key ? this.state.scheduleByObject[key] : null;
     }
 
-    hasOtherScheduled(name) {
-      return !!(
-        this.state.scheduledObject &&
-        name &&
-        !this.isScheduled(name)
-      );
+    hasPendingSchedule(name) {
+      if (!this.state.scheduleActive) return false;
+      const entry = this.getScheduleEntry(name);
+      return !!(entry && entry.pending && entry.pending.length > 0);
+    }
+
+    normalizeSchedule(schedule) {
+      const byObject = {};
+      const active = !!schedule.active;
+      const ingest = (objName, meta) => {
+        const layers = meta.layers || [];
+        const done = meta.done || [];
+        const pending = layers.filter((l) => !done.includes(l));
+        byObject[objName] = { layers, done, pending };
+      };
+      if (schedule.objects && typeof schedule.objects === "object") {
+        for (const [objName, meta] of Object.entries(schedule.objects)) {
+          ingest(objName, meta || {});
+        }
+      } else if (schedule.object) {
+        ingest(schedule.object, schedule);
+      }
+      return { byObject, active };
     }
 
     hasSlicerIron(name) {
@@ -214,19 +237,28 @@
     }
 
     applySchedule(schedule) {
-      if (!schedule || (!schedule.active && !(schedule.done || []).length)) {
-        this.state.scheduledObject = null;
+      if (!schedule) {
+        this.state.scheduleByObject = {};
+        this.state.scheduleActive = false;
         return;
       }
-      this.state.scheduledObject = schedule.object || null;
-      if (this.state.selected && this.isScheduled(this.state.selected)) {
+      const norm = this.normalizeSchedule(schedule);
+      this.state.scheduleByObject = norm.byObject;
+      this.state.scheduleActive = norm.active;
+      if (this.state.selected && this.hasPendingSchedule(this.state.selected)) {
         this.closeModeDialog();
       }
     }
 
+    scheduledObjectFromError(msg) {
+      const m = String(msg || "").match(/already scheduled for\s+(.+?)(?:\.|$)/i);
+      return m ? m[1].trim() : null;
+    }
+
     async fetchSchedule() {
       if (!this.state.filename) {
-        this.state.scheduledObject = null;
+        this.state.scheduleByObject = {};
+        this.state.scheduleActive = false;
         return;
       }
       try {
@@ -288,20 +320,15 @@
         this.setStatus(`${this.shortLabel(name)} already has OrcaSlicer ironing in this file`);
         return;
       }
-      if (this.isScheduled(name)) {
-        this.setStatus(`Injector iron already scheduled for ${this.shortLabel(name)}`);
+      if (this.hasPendingSchedule(name)) {
+        this.setStatus(
+          `${this.shortLabel(name)} is waiting for injector iron — pick another object`
+        );
         return;
       }
       this.state.selected = name;
       this.renderMap();
-      if (this.hasOtherScheduled(name)) {
-        this.setStatus(
-          `${this.shortLabel(this.state.scheduledObject)} is scheduled. ` +
-            `You can view ${this.shortLabel(name)}, but only one object per print.`
-        );
-      } else {
-        this.setStatus("");
-      }
+      this.setStatus("");
       this.updateModeDialog();
     }
 
@@ -399,17 +426,18 @@
         const points = obj.polygon.map(([x, y]) => `${this.convertX(x)},${this.convertY(y)}`).join(" ");
         poly.setAttribute("points", points);
 
-        let cls = "obj-shape available";
-        if (this.state.excluded.includes(obj.name)) cls = "obj-shape excluded";
-        else if (this.hasSlicerIron(obj.name)) cls = "obj-shape slicer-iron";
-        else if (this.isScheduled(obj.name)) cls = "obj-shape scheduled";
+        let cls = "obj-shape";
+        if (this.state.excluded.includes(obj.name)) cls += " excluded";
+        else if (this.hasSlicerIron(obj.name)) cls += " slicer-iron";
+        else if (this.hasPendingSchedule(obj.name)) cls += " scheduled";
+        else cls += " available";
         if (obj.name === this.state.current) cls += " current";
-        if (obj.name === this.state.selected) cls = "obj-shape selected";
+        if (obj.name === this.state.selected && !this.hasPendingSchedule(obj.name)) cls += " selected";
         poly.setAttribute("class", cls);
 
         const clickable =
           !this.state.excluded.includes(obj.name) &&
-          !this.isScheduled(obj.name) &&
+          !this.hasPendingSchedule(obj.name) &&
           !this.hasSlicerIron(obj.name) &&
           this.printActive();
         if (clickable) {
@@ -419,8 +447,8 @@
           let tip = this.shortLabel(obj.name);
           if (this.hasSlicerIron(obj.name)) {
             tip = `${tip} (slicer iron)`;
-          } else if (this.isScheduled(obj.name)) {
-            tip = `${tip} (iron scheduled)`;
+          } else if (this.hasPendingSchedule(obj.name)) {
+            tip = `${tip} (waiting for iron)`;
           }
           poly.addEventListener("mousemove", (ev) => this.showTooltip(ev, tip));
           poly.addEventListener("mouseleave", () => this.hideTooltip());
@@ -541,7 +569,6 @@
           `Iron scheduled for ${this.shortLabel(result.object || this.state.selected)}` +
             (layers ? ` at layer(s) ${layers}` : "")
         );
-        this.state.scheduledObject = result.object || this.state.selected;
         this.fetchSchedule().catch(() => {});
         this.renderMap();
         setTimeout(() => this.closeModeDialog(), 1500);
@@ -550,8 +577,10 @@
           err.name === "TimeoutError" || err.name === "AbortError"
             ? "Request timed out"
             : err.message;
-        if (/only one object per print/i.test(msg)) {
-          msg = `Only one object per print. ${this.shortLabel(this.state.scheduledObject || "")} is already scheduled.`;
+        if (/already scheduled for/i.test(msg)) {
+          const who = this.scheduledObjectFromError(msg) || this.state.selected || "this object";
+          msg = `${this.shortLabel(who)} is already scheduled for iron.`;
+          this.fetchSchedule().catch(() => {});
         } else if (/already has slicer ironing/i.test(msg)) {
           msg = `${this.shortLabel(this.state.selected || "")} already has OrcaSlicer ironing in this gcode file`;
         }
@@ -570,7 +599,8 @@
       const prevFile = this.state.filename;
       const nextFile = printStats.filename || "";
       if (prevFile && nextFile && prevFile !== nextFile) {
-        this.state.scheduledObject = null;
+        this.state.scheduleByObject = {};
+        this.state.scheduleActive = false;
         this.state.ironCache = {};
         this.state.selected = null;
         this.closeModeDialog();

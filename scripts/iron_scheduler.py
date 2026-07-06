@@ -77,6 +77,106 @@ def schedule_path_for(gcode_file: Path) -> Path:
     return CACHE_DIR / f"{gcode_file.name}.schedule.json"
 
 
+def watcher_lock_path(gcode_file: Path) -> Path:
+    return CACHE_DIR / f"{gcode_file.name}.watcher.lock"
+
+
+SCHEDULE_VERSION = 2
+
+
+def normalize_schedule(data: dict[str, Any]) -> dict[str, Any]:
+    """Support legacy single-object schedules and multi-object v2 format."""
+    if data.get("objects"):
+        return data
+    obj = data.get("object")
+    if not obj:
+        return {**data, "version": SCHEDULE_VERSION, "objects": {}}
+    return {
+        "file": data.get("file"),
+        "version": SCHEDULE_VERSION,
+        "objects": {
+            obj: {
+                "mode": data.get("mode", "all_top"),
+                "layers": list(data.get("layers") or []),
+                "done": list(data.get("done") or []),
+            }
+        },
+        "active": bool(data.get("active", True)),
+        "print_duration_at_schedule": data.get("print_duration_at_schedule"),
+        "gcode_mtime": data.get("gcode_mtime"),
+    }
+
+
+def resolve_schedule_object(
+    schedule: dict[str, Any], name: str
+) -> tuple[str | None, dict[str, Any] | None]:
+    objects = normalize_schedule(schedule).get("objects") or {}
+    if name in objects:
+        return name, objects[name]
+    folded = {k.casefold(): k for k in objects}
+    key = folded.get(name.casefold())
+    if key:
+        return key, objects[key]
+    return None, None
+
+
+def object_schedule_pending(schedule: dict[str, Any], obj_name: str) -> bool:
+    if not schedule.get("active"):
+        return False
+    _, obj_sched = resolve_schedule_object(schedule, obj_name)
+    if not obj_sched:
+        return False
+    layers = obj_sched.get("layers") or []
+    done = set(obj_sched.get("done") or [])
+    return any(layer not in done for layer in layers)
+
+
+def schedule_all_complete(schedule: dict[str, Any]) -> bool:
+    norm = normalize_schedule(schedule)
+    objects = norm.get("objects") or {}
+    if not objects:
+        return True
+    for obj_sched in objects.values():
+        layers = obj_sched.get("layers") or []
+        done = set(obj_sched.get("done") or [])
+        if any(layer not in done for layer in layers):
+            return False
+    return True
+
+
+def watcher_is_running(gcode_file: Path) -> bool:
+    lock = watcher_lock_path(gcode_file)
+    if not lock.is_file():
+        return False
+    try:
+        pid = int(lock.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        lock.unlink(missing_ok=True)
+        return False
+
+
+def start_watcher(gcode_file: Path) -> None:
+    if watcher_is_running(gcode_file):
+        return
+    watcher = Path(__file__).with_name("iron_watcher.py")
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(watcher),
+            "--file",
+            str(gcode_file),
+            "--schedule",
+            str(schedule_path_for(gcode_file)),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    watcher_lock_path(gcode_file).write_text(str(proc.pid))
+
+
 def _apply_meta_kv(meta: dict[str, Any], key: str, value: str) -> None:
     if key == "top_shell_layers":
         meta["top_shell_layers"] = int(float(value))
@@ -825,25 +925,14 @@ def cmd_enable(args: argparse.Namespace) -> int:
         print(json.dumps(result))
         return 1
 
-    if existing:
-        sched_obj = existing.get("object", "")
-        if sched_obj and resolve_object_name(cache, sched_obj) == canonical:
-            if existing.get("active") or existing.get("done"):
-                result = {
-                    "ok": False,
-                    "error": f"Iron already scheduled for {sched_obj}",
-                }
-                report_enable_result(result)
-                print(json.dumps(result))
-                return 1
-        elif existing.get("active") or existing.get("done"):
-            result = {
-                "ok": False,
-                "error": f"Iron already scheduled for {sched_obj}. Only one object per print.",
-            }
-            report_enable_result(result)
-            print(json.dumps(result))
-            return 1
+    if existing and object_schedule_pending(existing, canonical):
+        result = {
+            "ok": False,
+            "error": f"Iron already scheduled for {canonical}",
+        }
+        report_enable_result(result)
+        print(json.dumps(result))
+        return 1
 
     cur = current_layer(cache, status)
     target_layers = [
@@ -857,25 +946,29 @@ def cmd_enable(args: argparse.Namespace) -> int:
         print(json.dumps(result))
         return 1
 
-    schedule = {
-        "file": gcode_file.name,
-        "object": canonical,
+    if existing:
+        schedule = normalize_schedule(existing)
+    else:
+        schedule = {
+            "file": gcode_file.name,
+            "version": SCHEDULE_VERSION,
+            "objects": {},
+            "active": True,
+            "print_duration_at_schedule": print_duration,
+            "gcode_mtime": gcode_mtime(gcode_file),
+        }
+
+    schedule["objects"][canonical] = {
         "mode": args.mode,
         "layers": target_layers,
         "done": [],
-        "active": True,
-        "print_duration_at_schedule": print_duration,
-        "gcode_mtime": gcode_mtime(gcode_file),
     }
+    schedule["active"] = True
+    schedule.setdefault("print_duration_at_schedule", print_duration)
+    schedule.setdefault("gcode_mtime", gcode_mtime(gcode_file))
     schedule_path_for(gcode_file).write_text(json.dumps(schedule, indent=2))
 
-    watcher = Path(__file__).with_name("iron_watcher.py")
-    subprocess.Popen(
-        [sys.executable, str(watcher), "--file", str(gcode_file), "--schedule", str(schedule_path_for(gcode_file))],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    start_watcher(gcode_file)
     result = {"ok": True, "scheduled_layers": target_layers, "object": canonical}
     report_enable_result(result)
     print(json.dumps(result))
