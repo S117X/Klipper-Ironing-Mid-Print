@@ -170,10 +170,11 @@ def main() -> int:
     last_logged_layer = -1
     stale_layer_polls = 0
     waiting_logged: set[tuple[str, int]] = set()
+    failed_logged: set[tuple[str, int]] = set()
     try:
         while True:
             state = get_print_state()
-            if state not in ("printing", "paused"):
+            if state and state not in ("printing", "paused"):
                 if schedule_path.is_file():
                     schedule_path.unlink(missing_ok=True)
                 log(f"watcher exit: print ended state={state} file={gcode_file.name}")
@@ -214,8 +215,11 @@ def main() -> int:
                     if layer < target:
                         continue
 
-                    trigger_byte = inject_after_byte(cache, obj_name, target)
                     wait_key = (obj_name, target)
+                    if wait_key in failed_logged:
+                        continue
+
+                    trigger_byte = inject_after_byte(cache, obj_name, target)
                     if trigger_byte is not None and file_pos < trigger_byte:
                         if wait_key not in waiting_logged:
                             log(
@@ -255,6 +259,9 @@ def main() -> int:
                         log(f"inject ok object={obj_name} layer={target}")
                     else:
                         err = (proc.stderr or proc.stdout or "unknown error").strip()
+                        if len(err) > 400:
+                            err = err[:400] + "..."
+                        failed_logged.add(wait_key)
                         log(f"inject failed object={obj_name} layer={target}: {err}")
 
             if changed:
