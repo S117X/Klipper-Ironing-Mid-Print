@@ -21,7 +21,10 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from iron_scheduler import (  # noqa: E402
+    cleanup_watcher_artifacts,
     normalize_schedule,
+    print_job_active,
+    print_job_finished,
     schedule_all_complete,
     watcher_lock_path,
 )
@@ -66,8 +69,7 @@ def get_current_layer(cache: dict, status: dict | None = None) -> int:
         if not cache.get("layer_byte_offsets") or fp <= 0:
             return 0
 
-        state = str(print_stats.get("state") or "")
-        if state in ("printing", "paused") or vsd.get("is_active"):
+        if print_job_active(status):
             return layer_from_file_position(cache, fp)
     except (KeyError, TypeError, ValueError):
         return 0
@@ -80,14 +82,6 @@ def get_file_position(status: dict | None = None) -> int:
         return int(status.get("virtual_sdcard", {}).get("file_position") or 0)
     except (KeyError, TypeError, ValueError):
         return 0
-
-
-def get_print_state() -> str:
-    try:
-        resp = moonraker_get("/printer/objects/query?print_stats")
-        return resp["result"]["status"]["print_stats"].get("state", "")
-    except (KeyError, urllib.error.URLError, json.JSONDecodeError):
-        return ""
 
 
 def load_cache(gcode_file: Path) -> dict:
@@ -139,6 +133,10 @@ def main() -> int:
         except OSError:
             pass
 
+    def stop_watching(reason: str) -> None:
+        cleanup_watcher_artifacts(gcode_file, schedule_path)
+        log(f"watcher exit: {reason} file={gcode_file.name}")
+
     lock_path = watcher_lock_path(gcode_file)
     try:
         lock_path.write_text(str(os.getpid()))
@@ -155,16 +153,19 @@ def main() -> int:
         f"objects={list((initial.get('objects') or {}).keys())}"
     )
 
-    # Wait for print to start (enable may arrive before Klipper reports printing).
+    seen_printing = False
     for _ in range(120):
-        state = get_print_state()
-        if state in ("printing", "paused"):
+        status = get_print_status()
+        if print_job_active(status):
+            seen_printing = True
             break
+        finished, reason = print_job_finished(status, gcode_file, seen_printing=False)
+        if finished:
+            stop_watching(f"before_start {reason}")
+            return 1
         time.sleep(0.5)
     else:
-        log(f"watcher exit: print never started for {gcode_file.name}")
-        schedule_path.unlink(missing_ok=True)
-        lock_path.unlink(missing_ok=True)
+        stop_watching("print never started")
         return 1
 
     last_logged_layer = -1
@@ -173,19 +174,31 @@ def main() -> int:
     failed_logged: set[tuple[str, int]] = set()
     try:
         while True:
-            state = get_print_state()
-            if state and state not in ("printing", "paused"):
-                if schedule_path.is_file():
-                    schedule_path.unlink(missing_ok=True)
-                log(f"watcher exit: print ended state={state} file={gcode_file.name}")
+            status = get_print_status()
+            if print_job_active(status):
+                seen_printing = True
+
+            finished, reason = print_job_finished(
+                status, gcode_file, seen_printing=seen_printing
+            )
+            if finished:
+                stop_watching(reason)
                 break
 
-            schedule = normalize_schedule(json.loads(schedule_path.read_text()))
+            if not schedule_path.is_file():
+                log(f"watcher exit: schedule removed file={gcode_file.name}")
+                break
+
+            try:
+                schedule = normalize_schedule(json.loads(schedule_path.read_text()))
+            except (json.JSONDecodeError, OSError):
+                stop_watching("schedule unreadable")
+                break
+
             if not schedule.get("active"):
                 time.sleep(1.5)
                 continue
 
-            status = get_print_status()
             layer = get_current_layer(cache, status)
             file_pos = get_file_position(status)
             if layer != last_logged_layer and layer > 0:
@@ -230,6 +243,22 @@ def main() -> int:
                             waiting_logged.add(wait_key)
                         continue
 
+                    status = get_print_status()
+                    finished, reason = print_job_finished(
+                        status, gcode_file, seen_printing=seen_printing
+                    )
+                    if finished:
+                        stop_watching(f"before_inject {reason}")
+                        return 0
+
+                    if not print_job_active(status):
+                        log(
+                            f"inject skipped object={obj_name} layer={target}: "
+                            "print not active"
+                        )
+                        failed_logged.add(wait_key)
+                        continue
+
                     log(
                         f"inject {gcode_file.name} object={obj_name} layer={target} "
                         f"(detected_layer={layer} file_pos={file_pos} "
@@ -263,6 +292,13 @@ def main() -> int:
                             err = err[:400] + "..."
                         failed_logged.add(wait_key)
                         log(f"inject failed object={obj_name} layer={target}: {err}")
+
+                    finished, reason = print_job_finished(
+                        get_print_status(), gcode_file, seen_printing=seen_printing
+                    )
+                    if finished:
+                        stop_watching(f"after_inject {reason}")
+                        return 0
 
             if changed:
                 schedule_path.write_text(json.dumps(schedule, indent=2))

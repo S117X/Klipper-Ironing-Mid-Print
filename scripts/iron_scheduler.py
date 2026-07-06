@@ -177,6 +177,76 @@ def start_watcher(gcode_file: Path) -> None:
     watcher_lock_path(gcode_file).write_text(str(proc.pid))
 
 
+TERMINAL_PRINT_STATES = frozenset({"complete", "cancelled", "error", "standby"})
+
+
+def watched_gcode_name(snapshot: dict[str, Any]) -> str:
+    ps = snapshot.get("print_stats") or {}
+    vsd = snapshot.get("virtual_sdcard") or {}
+    for raw in (ps.get("filename"), vsd.get("file_path")):
+        if raw:
+            return Path(str(raw)).name
+    return ""
+
+
+def print_job_active(snapshot: dict[str, Any]) -> bool:
+    ps = snapshot.get("print_stats") or {}
+    vsd = snapshot.get("virtual_sdcard") or {}
+    state = str(ps.get("state") or "")
+    if state in ("printing", "paused"):
+        return True
+    return bool(vsd.get("is_active"))
+
+
+def print_job_finished(
+    snapshot: dict[str, Any],
+    gcode_file: Path,
+    *,
+    seen_printing: bool,
+) -> tuple[bool, str]:
+    """Return whether the watched print job is over and why."""
+    if not seen_printing:
+        return False, ""
+
+    ps = snapshot.get("print_stats") or {}
+    vsd = snapshot.get("virtual_sdcard") or {}
+    state = str(ps.get("state") or "")
+    message = str(ps.get("message") or "").strip()
+    active = print_job_active(snapshot)
+    current = watched_gcode_name(snapshot)
+
+    if current and current != gcode_file.name:
+        return True, f"different_file={current}"
+
+    if state in ("complete", "cancelled", "error"):
+        suffix = f" msg={message}" if message else ""
+        return True, f"state={state}{suffix}"
+
+    if state == "standby" and not active:
+        suffix = f" msg={message}" if message else ""
+        return True, f"state=standby{suffix}"
+
+    if not active:
+        progress = float(vsd.get("progress") or 0)
+        file_pos = int(vsd.get("file_position") or 0)
+        file_size = int(vsd.get("file_size") or 0)
+        if file_size > 0 and (progress >= 0.995 or file_pos >= file_size - 32):
+            return True, "sdcard_complete"
+        if file_pos == 0 and not current:
+            return True, "job_cleared"
+
+    return False, ""
+
+
+def cleanup_watcher_artifacts(
+    gcode_file: Path,
+    schedule_path: Path | None = None,
+) -> None:
+    path = schedule_path or schedule_path_for(gcode_file)
+    path.unlink(missing_ok=True)
+    watcher_lock_path(gcode_file).unlink(missing_ok=True)
+
+
 def _apply_meta_kv(meta: dict[str, Any], key: str, value: str) -> None:
     if key == "top_shell_layers":
         meta["top_shell_layers"] = int(float(value))
