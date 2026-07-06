@@ -219,7 +219,8 @@ def main() -> int:
                         f"file_pos={vsd.get('file_position')}"
                     )
 
-            changed = False
+            ready: list[tuple[int, str, int]] = []
+            waiting: list[tuple[str, int, int]] = []
             for obj_name, obj_sched in (schedule.get("objects") or {}).items():
                 done = list(obj_sched.get("done") or [])
                 for target in obj_sched.get("layers") or []:
@@ -227,13 +228,10 @@ def main() -> int:
                         continue
                     if layer < target:
                         continue
-
                     wait_key = (obj_name, target)
-                    if wait_key in failed_logged:
-                        continue
-
                     trigger_byte = inject_after_byte(cache, obj_name, target)
                     if trigger_byte is not None and file_pos < trigger_byte:
+                        waiting.append((trigger_byte, obj_name, target))
                         if wait_key not in waiting_logged:
                             log(
                                 f"waiting top surface file={gcode_file.name} "
@@ -242,23 +240,34 @@ def main() -> int:
                             )
                             waiting_logged.add(wait_key)
                         continue
-
-                    status = get_print_status()
-                    finished, reason = print_job_finished(
-                        status, gcode_file, seen_printing=seen_printing
-                    )
-                    if finished:
-                        stop_watching(f"before_inject {reason}")
-                        return 0
-
-                    if not print_job_active(status):
-                        log(
-                            f"inject skipped object={obj_name} layer={target}: "
-                            "print not active"
-                        )
-                        failed_logged.add(wait_key)
+                    if wait_key in failed_logged:
                         continue
+                    ready.append((trigger_byte or 0, obj_name, target))
 
+            ready.sort(key=lambda item: item[0])
+            for trigger_byte, obj_name, target in waiting:
+                waiting_logged.add((obj_name, target))
+
+            changed = False
+            if ready:
+                trigger_byte, obj_name, target = ready[0]
+                wait_key = (obj_name, target)
+
+                status = get_print_status()
+                finished, reason = print_job_finished(
+                    status, gcode_file, seen_printing=seen_printing
+                )
+                if finished:
+                    stop_watching(f"before_inject {reason}")
+                    return 0
+
+                if not print_job_active(status):
+                    log(
+                        f"inject skipped object={obj_name} layer={target}: "
+                        "print not active"
+                    )
+                    failed_logged.add(wait_key)
+                else:
                     log(
                         f"inject {gcode_file.name} object={obj_name} layer={target} "
                         f"(detected_layer={layer} file_pos={file_pos} "
@@ -279,8 +288,11 @@ def main() -> int:
                         text=True,
                         check=False,
                     )
+                    obj_sched = schedule["objects"][obj_name]
+                    done = list(obj_sched.get("done") or [])
                     if proc.returncode == 0:
-                        done.append(target)
+                        if target not in done:
+                            done.append(target)
                         obj_sched["done"] = done
                         schedule["objects"][obj_name] = obj_sched
                         changed = True

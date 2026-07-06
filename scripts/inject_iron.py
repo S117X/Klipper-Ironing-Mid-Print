@@ -13,8 +13,7 @@ from pathlib import Path
 PRINTER_DATA = Path(os.environ.get("PRINTER_DATA", "/home/x/printer_data"))
 CACHE_DIR = PRINTER_DATA / "iron_cache"
 MOONRAKER_URL = os.environ.get("MOONRAKER_URL", "http://127.0.0.1:7125")
-IRON_LINE_BATCH = 12
-IRON_SCRIPT_TIMEOUT = 60
+IRON_SCRIPT_TIMEOUT = 300
 
 
 def moonraker_get(path: str) -> dict:
@@ -49,26 +48,6 @@ def moonraker_script(script: str) -> None:
         resp.read()
 
 
-def stream_iron_lines(snippet: str, object_name: str, layer: int) -> None:
-    moves = [line.strip() for line in snippet.splitlines() if line.strip()]
-    moonraker_script(
-        f"; IRON object={object_name} layer={layer}\n"
-        "SAVE_GCODE_STATE NAME=IRON_STATE"
-    )
-    batch: list[str] = []
-    for line in moves:
-        batch.append(line)
-        if len(batch) >= IRON_LINE_BATCH:
-            moonraker_script("\n".join(batch))
-            batch = []
-            state = print_state()
-            if state in ("complete", "cancelled", "standby", "error"):
-                raise SystemExit(f"Print ended during iron ({state})")
-    if batch:
-        moonraker_script("\n".join(batch))
-    moonraker_script("RESTORE_GCODE_STATE NAME=IRON_STATE MOVE=1")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--file", required=True, help="G-code filename")
@@ -99,7 +78,18 @@ def main() -> int:
     if not snippet:
         raise SystemExit(f"No iron gcode for layer {args.layer}")
 
-    stream_iron_lines(snippet, args.object, args.layer)
+    script_lines = [
+        f"; IRON object={args.object} layer={args.layer}",
+        "SAVE_GCODE_STATE NAME=IRON_STATE",
+    ]
+    for line in snippet.splitlines():
+        line = line.strip()
+        if line:
+            script_lines.append(line)
+    # MOVE=0: restore coords/feedrate but do NOT jump back to the saved
+    # toolhead position (MOVE=1 caused back-and-forth between objects).
+    script_lines.append("RESTORE_GCODE_STATE NAME=IRON_STATE MOVE=0")
+    moonraker_script("\n".join(script_lines) + "\n")
     return 0
 
 
