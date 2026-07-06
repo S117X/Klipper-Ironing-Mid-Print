@@ -145,11 +145,19 @@ def object_near_print_end(
 def build_iron_script(
     cache: dict,
     items: list[tuple[str, int]],
+    *,
+    hold_sd: bool = False,
 ) -> tuple[str, bool]:
-    """One uninterrupted script for all scheduled objects (print order)."""
-    script_lines = ["SAVE_GCODE_STATE NAME=IRON_STATE"]
-    append_print_end = False
-    total_est = 0.0
+    """One uninterrupted script for all scheduled objects (print order).
+
+    Never appends PRINT_END — the gcode file already contains it. Injecting
+    PRINT_END early is what turns the case light off while iron is still running.
+    """
+    script_lines: list[str] = []
+    near_print_end = False
+    if hold_sd:
+        script_lines.append("M25")
+    script_lines.append("SAVE_GCODE_STATE NAME=IRON_STATE")
 
     for object_name, layer in items:
         obj = resolve_cache_object(cache, object_name)
@@ -161,10 +169,8 @@ def build_iron_script(
 
         trigger_byte = (obj.get("inject_after_byte") or {}).get(str(layer))
         if object_near_print_end(cache, obj, layer, trigger_byte):
-            append_print_end = True
+            near_print_end = True
 
-        stats = iron_move_stats(snippet)
-        total_est += float(stats["est_seconds"])
         script_lines.append(f"; IRON object={object_name} layer={layer}")
         for line in snippet.splitlines():
             line = line.strip()
@@ -172,15 +178,16 @@ def build_iron_script(
                 script_lines.append(line)
 
     script_lines.append("RESTORE_GCODE_STATE NAME=IRON_STATE MOVE=0")
-    if append_print_end:
-        script_lines.append("PRINT_END")
-    return "\n".join(script_lines) + "\n", append_print_end
+    if hold_sd:
+        script_lines.append("M24")
+    return "\n".join(script_lines) + "\n", near_print_end
 
 
 def inject_chain(
     gcode_file: str,
     items: list[tuple[str, int]],
     trigger_byte: int | None = None,
+    hold_sd: bool = False,
 ) -> int:
     """Inject all objects in one gcode/script — no pause, no gap between irons."""
     if not items:
@@ -201,6 +208,11 @@ def inject_chain(
 
     file_pos = file_position()
     if print_end_byte is not None:
+        if file_pos >= int(print_end_byte):
+            raise SystemExit(
+                f"Refusing iron inject: file_pos={file_pos} already at/past "
+                f"PRINT_END at {print_end_byte} (SD end macro likely ran)"
+            )
         room_now = int(print_end_byte) - file_pos
         room = room_now
         if trigger_byte is not None:
@@ -220,11 +232,23 @@ def inject_chain(
 
     names = [f"{name}:L{layer}" for name, layer in items]
     xy = toolhead_xy()
-    script, near_print_end = build_iron_script(cache, items)
+    if hold_sd or any(
+        object_near_print_end(
+            cache,
+            resolve_cache_object(cache, name) or {},
+            layer,
+            (resolve_cache_object(cache, name) or {})
+            .get("inject_after_byte", {})
+            .get(str(layer)),
+        )
+        for name, layer in items
+    ):
+        hold_sd = True
+    script, near_print_end = build_iron_script(cache, items, hold_sd=hold_sd)
     live_log(
         f"CHAIN_START file={gcode_file} objects={names} file_pos={file_pos} "
-        f"near_eof={near_print_end} toolhead={xy} settings={settings} "
-        f"script_bytes={len(script)}"
+        f"near_eof={near_print_end} hold_sd={hold_sd} toolhead={xy} "
+        f"settings={settings} script_bytes={len(script)}"
     )
 
     t0 = time.monotonic()
@@ -242,9 +266,13 @@ def inject_object(
     object_name: str,
     layer: int,
     trigger_byte: int | None = None,
+    hold_sd: bool = False,
 ) -> int:
     return inject_chain(
-        gcode_file, [(object_name, layer)], trigger_byte=trigger_byte
+        gcode_file,
+        [(object_name, layer)],
+        trigger_byte=trigger_byte,
+        hold_sd=hold_sd,
     )
 
 

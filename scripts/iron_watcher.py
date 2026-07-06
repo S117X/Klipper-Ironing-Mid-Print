@@ -126,6 +126,7 @@ def pending_inject_targets(
     """Return (waiting_for_trigger, ready_now) sorted by gcode byte order."""
     waiting: list[tuple[int, str, int]] = []
     ready: list[tuple[int, str, int]] = []
+    layer_pending: list[tuple[int, str, int]] = []
 
     for obj_name, obj_sched in (schedule.get("objects") or {}).items():
         done = set(obj_sched.get("done") or [])
@@ -137,16 +138,32 @@ def pending_inject_targets(
                 continue
             trigger_byte = inject_after_byte(cache, obj_name, target)
             if trigger_byte is None:
-                ready.append((0, obj_name, target))
+                entry = (0, obj_name, target)
+                layer_pending.append(entry)
                 continue
             entry = (int(trigger_byte), obj_name, target)
+            layer_pending.append(entry)
             if file_pos < int(trigger_byte):
                 waiting.append(entry)
-            else:
-                ready.append(entry)
 
-    waiting.sort(key=lambda item: item[0])
-    ready.sort(key=lambda item: item[0])
+    if not layer_pending:
+        return waiting, ready
+
+    # Multi-object same layer: wait until every trigger has passed, then
+    # inject all cubes in one Klipper script (prevents SD hitting PRINT_END
+    # while the first cube is still ironing).
+    if len(layer_pending) > 1:
+        if all(file_pos >= entry[0] for entry in layer_pending):
+            ready = sorted(layer_pending, key=lambda item: item[0])
+        else:
+            waiting = sorted(layer_pending, key=lambda item: item[0])
+        return waiting, ready
+
+    entry = layer_pending[0]
+    if file_pos >= entry[0]:
+        ready = [entry]
+    else:
+        waiting = [entry]
     return waiting, ready
 
 
@@ -322,33 +339,39 @@ def main() -> int:
         waiting_logged.discard(wait_key)
         log(f"inject ok object={obj_name} layer={target}")
 
-    def start_inject_async(
-        obj_name: str,
-        target: int,
-        trigger_byte: int,
+    def start_chain_inject_async(
+        batch: list[tuple[int, str, int]],
         layer: int,
         file_pos: int,
     ) -> None:
-        wait_key = (obj_name, target)
+        """One Klipper script for all ready objects — avoids SD racing to PRINT_END."""
+        wait_keys = [(name, target) for _, name, target in batch]
+        names = [f"{name}:L{target}" for _, name, target in batch]
+        first_trigger = batch[0][0]
 
         def worker() -> None:
+            rc = 0
+            err = ""
             try:
-                inject_iron.inject_object(
-                    gcode_file.name, obj_name, target, trigger_byte=trigger_byte
+                inject_iron.inject_chain(
+                    gcode_file.name,
+                    [(name, target) for _, name, target in batch],
+                    trigger_byte=first_trigger,
                 )
-                rc = 0
-                err = ""
             except SystemExit as exc:
                 rc = int(exc.code) if isinstance(exc.code, int) else 1
                 err = str(exc)
-            mark_inject_done(wait_key, obj_name, target, rc, err)
+            for _, obj_name, target in batch:
+                mark_inject_done((obj_name, target), obj_name, target, rc, err)
 
         log(
-            f"inject {gcode_file.name} object={obj_name} layer={target} "
+            f"inject chain {gcode_file.name} objects={names} "
             f"(detected_layer={layer} file_pos={file_pos} "
-            f"trigger_byte={trigger_byte})"
+            f"first_trigger={first_trigger})"
         )
-        threading.Thread(target=worker, daemon=True, name=f"iron-{obj_name}").start()
+        threading.Thread(
+            target=worker, daemon=True, name=f"iron-chain-{batch[0][1]}"
+        ).start()
 
     try:
         while True:
@@ -425,7 +448,7 @@ def main() -> int:
                 finished, reason = print_job_finished(
                     status, gcode_file, seen_printing=seen_printing
                 )
-                if finished:
+                if finished and not inflight:
                     stop_watching(f"before_inject {reason}")
                     return 0
 
@@ -439,6 +462,7 @@ def main() -> int:
                         failed_logged.add(wait_key)
                 else:
                     file_pos = get_file_position(status)
+                    batch: list[tuple[int, str, int]] = []
                     for trigger_byte, obj_name, target in ready:
                         wait_key = (obj_name, target)
                         if wait_key in failed_logged or wait_key in session_done:
@@ -453,12 +477,45 @@ def main() -> int:
                         with inflight_lock:
                             if wait_key in inflight or wait_key in launched:
                                 continue
-                        if not claim_inject_target(obj_name, target):
-                            continue
-                        start_inject_async(
-                            obj_name, target, trigger_byte, layer, file_pos
-                        )
-                        launched_this_loop = True
+                        batch.append((trigger_byte, obj_name, target))
+
+                    if batch:
+                        claimed: list[tuple[int, str, int]] = []
+                        for entry in batch:
+                            _, obj_name, target = entry
+                            if claim_inject_target(obj_name, target):
+                                claimed.append(entry)
+                            else:
+                                for _, n, t in claimed:
+                                    with schedule_lock:
+                                        try:
+                                            sched = normalize_schedule(
+                                                json.loads(
+                                                    schedule_path.read_text()
+                                                )
+                                            )
+                                            o = sched.get("objects", {}).get(n)
+                                            if o:
+                                                o["launching"] = [
+                                                    ly
+                                                    for ly in (
+                                                        o.get("launching") or []
+                                                    )
+                                                    if ly != t
+                                                ]
+                                                sched["objects"][n] = o
+                                                schedule_path.write_text(
+                                                    json.dumps(sched, indent=2)
+                                                )
+                                        except (json.JSONDecodeError, OSError):
+                                            pass
+                                claimed = []
+                                break
+                        if claimed:
+                            start_chain_inject_async(
+                                claimed, layer, file_pos
+                            )
+                            launched_this_loop = True
 
             with schedule_lock:
                 try:
