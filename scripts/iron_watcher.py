@@ -219,6 +219,21 @@ def main() -> int:
                         f"file_pos={vsd.get('file_position')}"
                     )
 
+            # --- Fast polling near any pending trigger (for tight EOF margins) ---
+            poll_sec = 1.5
+            for obj_name, obj_sched in (schedule.get("objects") or {}).items():
+                done = list(obj_sched.get("done") or [])
+                for target in obj_sched.get("layers") or []:
+                    if target in done:
+                        continue
+                    tb = inject_after_byte(cache, obj_name, target)
+                    if tb and file_pos > 0 and (tb - file_pos) < 8192:
+                        poll_sec = 0.08
+                        break
+                else:
+                    continue
+                break
+
             ready: list[tuple[int, str, int]] = []
             waiting: list[tuple[str, int, int]] = []
             for obj_name, obj_sched in (schedule.get("objects") or {}).items():
@@ -319,7 +334,7 @@ def main() -> int:
                 schedule["active"] = False
                 schedule_path.write_text(json.dumps(schedule, indent=2))
 
-            time.sleep(1.5)
+            time.sleep(poll_sec)
     finally:
         lock_path.unlink(missing_ok=True)
 

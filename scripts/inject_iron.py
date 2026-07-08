@@ -79,6 +79,7 @@ def main() -> int:
         raise SystemExit(f"No iron gcode for layer {args.layer}")
 
     script_lines = [
+        "M25",
         f"; IRON object={args.object} layer={args.layer}",
         "SAVE_GCODE_STATE NAME=IRON_STATE",
     ]
@@ -86,9 +87,11 @@ def main() -> int:
         line = line.strip()
         if line:
             script_lines.append(line)
-    # MOVE=0: restore coords/feedrate but do NOT jump back to the saved
-    # toolhead position (MOVE=1 caused back-and-forth between objects).
+    # MOVE=0: restore feed/speed only — MOVE=1 jumps head between objects.
     script_lines.append("RESTORE_GCODE_STATE NAME=IRON_STATE MOVE=0")
+    # Always M24 so the SD card can continue to the next object's top surface.
+    # The next iron (if scheduled) will issue its own M25 when its trigger is reached.
+    script_lines.append("M24")
     moonraker_script("\n".join(script_lines) + "\n")
     return 0
 
