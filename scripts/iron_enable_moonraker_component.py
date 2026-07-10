@@ -23,11 +23,6 @@ PRINTER_DATA = Path(os.environ.get("PRINTER_DATA", "/home/x/printer_data"))
 CACHE_DIR = PRINTER_DATA / "iron_cache"
 SCRIPT = PRINTER_DATA / "scripts" / "iron_scheduler.py"
 MOONRAKER_URL = os.environ.get("MOONRAKER_URL", "http://127.0.0.1:7125")
-SCRIPT_DIR = PRINTER_DATA / "scripts"
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-
-import iron_scheduler  # noqa: E402
 
 
 def load_component(config: ConfigHelper) -> IronEnableComponent:
@@ -97,17 +92,12 @@ def _ensure_indexed(filename: str) -> None:
     if not gcode:
         return
     cache_path = CACHE_DIR / f"{Path(filename).name}.json"
-    stale = False
     try:
         stale = (
             not cache_path.is_file()
             or cache_path.stat().st_mtime < gcode.stat().st_mtime
         )
-        if not stale and cache_path.is_file():
-            data = json.loads(cache_path.read_text())
-            if iron_scheduler.cache_needs_rebuild(data):
-                stale = True
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+    except OSError:
         stale = True
     if not stale:
         return
