@@ -20,7 +20,7 @@ PRINTER_DATA = Path(os.environ.get("PRINTER_DATA", "/home/x/printer_data"))
 GCODE_DIR = PRINTER_DATA / "gcodes"
 CACHE_DIR = PRINTER_DATA / "iron_cache"
 MOONRAKER_URL = os.environ.get("MOONRAKER_URL", "http://127.0.0.1:7125")
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 
 CHANGE_LAYER_RE = re.compile(r"^;\s*(?:CHANGE_LAYER|LAYER_CHANGE)\b", re.I)
 Z_HEIGHT_RE = re.compile(r"^;\s*(?:Z_HEIGHT|Z):\s*([\d.]+)", re.I)
@@ -377,8 +377,21 @@ def iron_snippet_has_moves(snippet: str) -> bool:
     return False
 
 
+def find_print_end_byte(lines: list[str]) -> int | None:
+    """Byte offset of the first executable PRINT_END line in gcode text lines."""
+    offset = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "PRINT_END" or stripped.startswith("PRINT_END "):
+            return offset
+        offset += len(line) + 1
+    return None
+
+
 def cache_needs_rebuild(cache: dict[str, Any]) -> bool:
     if int(cache.get("cache_version") or 0) < CACHE_VERSION:
+        return True
+    if cache.get("print_end_byte") is None and cache.get("objects"):
         return True
     for obj in cache.get("objects", {}).values():
         if obj.get("layers") and not obj.get("inject_after_byte"):
@@ -882,6 +895,7 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
         "line_height": meta.get("iron_line_height"),
     }
 
+    print_end = find_print_end_byte(text)
     cache = {
         "file": gcode_file.name,
         "cache_version": CACHE_VERSION,
@@ -892,6 +906,8 @@ def index_gcode(gcode_file: Path) -> dict[str, Any]:
         "top_shell_layers": top_n,
         "top_layer_start": top_layer_start,
         "ironing_settings": ironing_settings,
+        "print_end_byte": print_end,
+        "file_size": sum(len(line) + 1 for line in text),
         "objects": objects,
     }
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1043,14 +1059,27 @@ def cmd_enable(args: argparse.Namespace) -> int:
             "gcode_mtime": gcode_mtime(gcode_file),
         }
 
+    triggers: dict[str, int] = {}
+    for layer in target_layers:
+        tb = inject_trigger_byte(cache, canonical, layer)
+        if tb is not None:
+            triggers[str(layer)] = tb
+
     schedule["objects"][canonical] = {
         "mode": args.mode,
         "layers": target_layers,
         "done": [],
+        "triggers": triggers,
     }
     schedule["active"] = True
+    schedule["print_end_byte"] = cache.get("print_end_byte")
     schedule.setdefault("print_duration_at_schedule", print_duration)
     schedule.setdefault("gcode_mtime", gcode_mtime(gcode_file))
+    schedule["policy"] = (
+        "multi-batch"
+        if len(schedule.get("objects") or {}) > 1
+        else "single"
+    )
     schedule_path_for(gcode_file).write_text(json.dumps(schedule, indent=2))
 
     start_watcher(gcode_file)
@@ -1058,6 +1087,10 @@ def cmd_enable(args: argparse.Namespace) -> int:
         "ok": True,
         "scheduled_layers": target_layers,
         "object": canonical,
+        "policy": schedule["policy"],
+        "triggers": triggers,
+        "print_end_byte": cache.get("print_end_byte"),
+        "objects_selected": list((schedule.get("objects") or {}).keys()),
     }
     report_enable_result(result)
     print(json.dumps(result))

@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Watch print layer changes and inject scheduled per-object ironing."""
+"""Mid-print iron controller.
+
+Failure we fix (from live log 2026-07-09 22:48–22:57)
+------------------------------------------------------
+1) Iron object A @ ~109932 (OK, hot)
+2) M24 resume → SD runs ~18s through rest of file
+3) file_pos jumps to PRINT_END (122209); only ~42 bytes after last top
+4) Iron object B after PRINT_END → cold / park moves
+
+Fix
+---
+* Iron first ready object with M25 + iron and **no M24** when more pending.
+* Then **splice**: remaining gcode until PRINT_END + remaining irons + PRINT_END
+  in one Moonraker script while SD stays paused; SDCARD_RESET_FILE after.
+* Never inject if file_pos >= PRINT_END or heater target is off.
+"""
 
 from __future__ import annotations
 
@@ -29,6 +44,11 @@ from iron_scheduler import (  # noqa: E402
     watcher_lock_path,
 )
 
+NEAR_TRIGGER_BYTES = 16384
+POLL_IDLE = 0.75
+POLL_NEAR = 0.05
+POLL_CRITICAL = 0.02
+
 
 def moonraker_get(path: str) -> dict:
     req = urllib.request.Request(f"{MOONRAKER_URL}{path}", method="GET")
@@ -48,7 +68,7 @@ def layer_from_file_position(cache: dict, file_position: int) -> int:
 def get_print_status() -> dict:
     try:
         resp = moonraker_get(
-            "/printer/objects/query?print_stats&virtual_sdcard&gcode_move"
+            "/printer/objects/query?print_stats&virtual_sdcard&gcode_move&extruder"
         )
         return resp["result"]["status"]
     except (KeyError, urllib.error.URLError, json.JSONDecodeError):
@@ -63,13 +83,9 @@ def get_current_layer(cache: dict, status: dict | None = None) -> int:
         cur = int(info.get("current_layer") or 0)
         if cur > 0:
             return cur
-
         vsd = status.get("virtual_sdcard", {})
         fp = int(vsd.get("file_position") or 0)
-        if not cache.get("layer_byte_offsets") or fp <= 0:
-            return 0
-
-        if print_job_active(status):
+        if cache.get("layer_byte_offsets") and fp > 0 and print_job_active(status):
             return layer_from_file_position(cache, fp)
     except (KeyError, TypeError, ValueError):
         return 0
@@ -84,6 +100,20 @@ def get_file_position(status: dict | None = None) -> int:
         return 0
 
 
+def heaters_alive(status: dict) -> bool:
+    ext = status.get("extruder") or {}
+    try:
+        temp = float(ext.get("temperature") or 0.0)
+        target = float(ext.get("target") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if target < 170.0:
+        return False
+    if temp < 170.0:
+        return False
+    return bool(ext.get("can_extrude")) or temp >= target - 25.0
+
+
 def load_cache(gcode_file: Path) -> dict:
     cache_path = CACHE_DIR / f"{gcode_file.name}.json"
     if not cache_path.is_file():
@@ -92,7 +122,6 @@ def load_cache(gcode_file: Path) -> dict:
 
 
 def inject_after_byte(cache: dict, object_name: str, layer: int) -> int | None:
-    """Byte offset in gcode file after the object's top surface (preferred) or block."""
     objects = cache.get("objects", {})
     obj = objects.get(object_name)
     if not obj:
@@ -102,15 +131,81 @@ def inject_after_byte(cache: dict, object_name: str, layer: int) -> int | None:
             obj = objects[key]
     if not obj:
         return None
-
     offsets = obj.get("inject_after_byte") or {}
     if str(layer) in offsets:
         return int(offsets[str(layer)])
-
     layer_offsets = cache.get("layer_byte_offsets") or {}
     if str(layer) in layer_offsets:
         return int(layer_offsets[str(layer)])
     return None
+
+
+def print_end_byte(cache: dict, gcode_file: Path) -> int | None:
+    raw = cache.get("print_end_byte")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    candidates = [gcode_file]
+    if not gcode_file.is_file():
+        candidates.append(PRINTER_DATA / "gcodes" / gcode_file.name)
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        pos = 0
+        for line in data.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped == b"PRINT_END" or stripped.startswith(b"PRINT_END "):
+                return pos
+            pos += len(line)
+    return None
+
+
+def pending_work(schedule: dict, cache: dict) -> list[tuple[int, str, int]]:
+    items: list[tuple[int, str, int]] = []
+    for obj_name, obj_sched in (schedule.get("objects") or {}).items():
+        done = set(obj_sched.get("done") or [])
+        for target in obj_sched.get("layers") or []:
+            if target in done:
+                continue
+            tb = inject_after_byte(cache, obj_name, int(target))
+            items.append((tb if tb is not None else 0, obj_name, int(target)))
+    items.sort(key=lambda x: (x[0], x[1], x[2]))
+    return items
+
+
+def classify_ready(
+    pending: list[tuple[int, str, int]],
+    *,
+    layer: int,
+    file_pos: int,
+) -> tuple[list[tuple[int, str, int]], list[tuple[int, str, int]]]:
+    ready: list[tuple[int, str, int]] = []
+    waiting: list[tuple[int, str, int]] = []
+    for trigger_byte, obj_name, target in pending:
+        if trigger_byte and file_pos < trigger_byte:
+            waiting.append((trigger_byte, obj_name, target))
+            continue
+        if not trigger_byte and layer < target:
+            waiting.append((trigger_byte, obj_name, target))
+            continue
+        ready.append((trigger_byte, obj_name, target))
+    return ready, waiting
+
+
+def mark_done(schedule: dict, pairs: list[tuple[str, int]]) -> None:
+    for obj_name, target in pairs:
+        obj_sched = schedule["objects"][obj_name]
+        done = list(obj_sched.get("done") or [])
+        if target not in done:
+            done.append(target)
+        obj_sched["done"] = done
+        schedule["objects"][obj_name] = obj_sched
 
 
 def main() -> int:
@@ -124,6 +219,7 @@ def main() -> int:
     inject = Path(__file__).with_name("inject_iron.py")
     cache = load_cache(gcode_file)
     log_path = CACHE_DIR / "iron_watcher.log"
+    end_byte = print_end_byte(cache, gcode_file)
 
     def log(msg: str) -> None:
         line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
@@ -135,7 +231,64 @@ def main() -> int:
 
     def stop_watching(reason: str) -> None:
         cleanup_watcher_artifacts(gcode_file, schedule_path)
-        log(f"watcher exit: {reason} file={gcode_file.name}")
+        log(f"controller exit: {reason} file={gcode_file.name}")
+
+    def run_cmd(cmd: list[str]) -> tuple[int, str]:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        err = (proc.stderr or proc.stdout or "").strip()
+        if len(err) > 600:
+            err = err[:600] + "..."
+        return proc.returncode, err
+
+    def iron_one_hold(obj_name: str, layer: int) -> tuple[int, str]:
+        """M25 + iron, leave SD paused (no M24)."""
+        return run_cmd(
+            [
+                sys.executable,
+                str(inject),
+                "--file",
+                str(gcode_file),
+                "--object",
+                obj_name,
+                "--layer",
+                str(layer),
+                "--sd",
+                "hold",
+            ]
+        )
+
+    def iron_one_full(obj_name: str, layer: int) -> tuple[int, str]:
+        """M25 + iron + M24 (last / only object)."""
+        return run_cmd(
+            [
+                sys.executable,
+                str(inject),
+                "--file",
+                str(gcode_file),
+                "--object",
+                obj_name,
+                "--layer",
+                str(layer),
+                "--sd",
+                "full",
+            ]
+        )
+
+    def splice_remaining(pairs: list[tuple[str, int]], from_byte: int) -> tuple[int, str]:
+        cmd = [
+            sys.executable,
+            str(inject),
+            "--file",
+            str(gcode_file),
+            "--batch",
+            json.dumps([[o, ly] for o, ly in pairs]),
+            "--splice-rest",
+            "--from-byte",
+            str(from_byte),
+        ]
+        if end_byte is not None:
+            cmd.extend(["--print-end-byte", str(end_byte)])
+        return run_cmd(cmd)
 
     lock_path = watcher_lock_path(gcode_file)
     try:
@@ -149,8 +302,10 @@ def main() -> int:
         initial = {"objects": {}}
 
     log(
-        f"watcher started file={gcode_file.name} "
-        f"objects={list((initial.get('objects') or {}).keys())}"
+        f"controller started file={gcode_file.name} "
+        f"objects={list((initial.get('objects') or {}).keys())} "
+        f"n={len(initial.get('objects') or {})} policy=asap+splice-rest "
+        f"print_end_byte={end_byte}"
     )
 
     seen_printing = False
@@ -169,9 +324,9 @@ def main() -> int:
         return 1
 
     last_logged_layer = -1
-    stale_layer_polls = 0
     waiting_logged: set[tuple[str, int]] = set()
     failed_logged: set[tuple[str, int]] = set()
+
     try:
         while True:
             status = get_print_status()
@@ -186,7 +341,7 @@ def main() -> int:
                 break
 
             if not schedule_path.is_file():
-                log(f"watcher exit: schedule removed file={gcode_file.name}")
+                log(f"controller exit: schedule removed file={gcode_file.name}")
                 break
 
             try:
@@ -196,7 +351,7 @@ def main() -> int:
                 break
 
             if not schedule.get("active"):
-                time.sleep(1.5)
+                time.sleep(POLL_IDLE)
                 continue
 
             layer = get_current_layer(cache, status)
@@ -207,134 +362,184 @@ def main() -> int:
                     f"file_pos={file_pos}"
                 )
                 last_logged_layer = layer
-                stale_layer_polls = 0
-            elif layer <= 0:
-                stale_layer_polls += 1
-                if stale_layer_polls in (10, 40, 80):
-                    vsd = status.get("virtual_sdcard", {})
-                    ps = status.get("print_stats", {})
+
+            # Hard stop: past PRINT_END with work left — do NOT cold iron.
+            if end_byte is not None and file_pos >= end_byte:
+                pending = pending_work(schedule, cache)
+                if pending:
                     log(
-                        f"layer detect stuck file={gcode_file.name} "
-                        f"state={ps.get('state')} is_active={vsd.get('is_active')} "
-                        f"file_pos={vsd.get('file_position')}"
+                        f"ABORT past PRINT_END file_pos={file_pos} end={end_byte} "
+                        f"pending={[(o, ly) for _, o, ly in pending]} — no cold iron"
                     )
+                    stop_watching("past_print_end_abort")
+                    return 1
 
-            # --- Fast polling near any pending trigger (for tight EOF margins) ---
-            poll_sec = 1.5
-            for obj_name, obj_sched in (schedule.get("objects") or {}).items():
-                done = list(obj_sched.get("done") or [])
-                for target in obj_sched.get("layers") or []:
-                    if target in done:
-                        continue
-                    tb = inject_after_byte(cache, obj_name, target)
-                    if tb and file_pos > 0 and (tb - file_pos) < 8192:
-                        poll_sec = 0.08
-                        break
-                else:
-                    continue
-                break
+            pending = pending_work(schedule, cache)
+            if not pending:
+                if schedule_all_complete(schedule):
+                    schedule["active"] = False
+                    schedule_path.write_text(json.dumps(schedule, indent=2))
+                    log(f"all iron complete file={gcode_file.name}")
+                time.sleep(POLL_IDLE)
+                continue
 
-            ready: list[tuple[int, str, int]] = []
-            waiting: list[tuple[str, int, int]] = []
-            for obj_name, obj_sched in (schedule.get("objects") or {}).items():
-                done = list(obj_sched.get("done") or [])
-                for target in obj_sched.get("layers") or []:
-                    if target in done:
-                        continue
-                    if layer < target:
-                        continue
-                    wait_key = (obj_name, target)
-                    trigger_byte = inject_after_byte(cache, obj_name, target)
-                    if trigger_byte is not None and file_pos < trigger_byte:
-                        waiting.append((trigger_byte, obj_name, target))
-                        if wait_key not in waiting_logged:
-                            log(
-                                f"waiting top surface file={gcode_file.name} "
-                                f"object={obj_name} layer={target} "
-                                f"file_pos={file_pos} need_byte={trigger_byte}"
-                            )
-                            waiting_logged.add(wait_key)
-                        continue
-                    if wait_key in failed_logged:
-                        continue
-                    ready.append((trigger_byte or 0, obj_name, target))
+            ready, waiting = classify_ready(
+                pending, layer=layer, file_pos=file_pos
+            )
 
-            ready.sort(key=lambda item: item[0])
             for trigger_byte, obj_name, target in waiting:
-                waiting_logged.add((obj_name, target))
+                key = (obj_name, target)
+                if key not in waiting_logged:
+                    log(
+                        f"waiting top surface file={gcode_file.name} "
+                        f"object={obj_name} layer={target} "
+                        f"file_pos={file_pos} need_byte={trigger_byte}"
+                    )
+                    waiting_logged.add(key)
 
-            changed = False
-            if ready:
-                trigger_byte, obj_name, target = ready[0]
-                wait_key = (obj_name, target)
+            next_trigger = min((t for t, _, _ in waiting if t), default=None)
+            dist_trig = (next_trigger - file_pos) if next_trigger else 10**9
+            dist_end = (end_byte - file_pos) if end_byte and file_pos else 10**9
+            poll_sec = POLL_IDLE
+            if dist_trig < NEAR_TRIGGER_BYTES or dist_end < NEAR_TRIGGER_BYTES:
+                poll_sec = POLL_NEAR
+            if dist_trig < 4096 or dist_end < 4096:
+                poll_sec = POLL_CRITICAL
 
-                status = get_print_status()
-                finished, reason = print_job_finished(
-                    status, gcode_file, seen_printing=seen_printing
+            if not ready:
+                time.sleep(poll_sec)
+                continue
+
+            # Fire earliest ready object only.
+            ready = [r for r in ready if (r[1], r[2]) not in failed_logged]
+            if not ready:
+                time.sleep(poll_sec)
+                continue
+
+            trigger_byte, obj_name, target = ready[0]
+            pairs_one = [(obj_name, target)]
+            more_after = len(pending) > 1
+
+            status = get_print_status()
+            finished, reason = print_job_finished(
+                status, gcode_file, seen_printing=seen_printing
+            )
+            if finished:
+                stop_watching(f"before_inject {reason}")
+                return 0
+
+            if not heaters_alive(status):
+                log(
+                    f"ABORT heaters dead before inject object={obj_name} "
+                    f"file_pos={get_file_position(status)}"
                 )
-                if finished:
-                    stop_watching(f"before_inject {reason}")
-                    return 0
+                stop_watching("heaters_off_before_inject")
+                return 1
 
-                if not print_job_active(status):
-                    log(
-                        f"inject skipped object={obj_name} layer={target}: "
-                        "print not active"
-                    )
-                    failed_logged.add(wait_key)
-                else:
-                    log(
-                        f"inject {gcode_file.name} object={obj_name} layer={target} "
-                        f"(detected_layer={layer} file_pos={file_pos} "
-                        f"trigger_byte={trigger_byte})"
-                    )
-                    proc = subprocess.run(
+            if end_byte is not None and get_file_position(status) >= end_byte:
+                log(
+                    f"ABORT at/past PRINT_END before inject object={obj_name} "
+                    f"file_pos={get_file_position(status)} end={end_byte}"
+                )
+                stop_watching("past_print_end_before_inject")
+                return 1
+
+            if more_after:
+                # Keep SD paused after this iron; splice the rest of the job.
+                log(
+                    f"inject HOLD (more pending) file={gcode_file.name} "
+                    f"items={pairs_one} file_pos={file_pos} layer={layer}"
+                )
+                rc, err = iron_one_hold(obj_name, target)
+                if rc != 0:
+                    failed_logged.add((obj_name, target))
+                    log(f"inject failed items={pairs_one}: {err}")
+                    time.sleep(poll_sec)
+                    continue
+
+                mark_done(schedule, pairs_one)
+                schedule_path.write_text(json.dumps(schedule, indent=2))
+                log(f"inject ok (held) items={pairs_one}")
+
+                # Still-paused position should be ~trigger of first object.
+                status = get_print_status()
+                held_pos = get_file_position(status)
+                rest = pending_work(schedule, cache)
+                rest_pairs = [(o, ly) for _, o, ly in rest]
+                if not rest_pairs:
+                    # Nothing else — just resume.
+                    log("no remaining pairs after hold; M24 resume")
+                    run_cmd(
                         [
                             sys.executable,
                             str(inject),
+                            "--sd",
+                            "resume",
                             "--file",
                             str(gcode_file),
-                            "--object",
-                            obj_name,
-                            "--layer",
-                            str(target),
-                        ],
-                        capture_output=True,
-                        text=True,
-                        check=False,
+                        ]
                     )
-                    obj_sched = schedule["objects"][obj_name]
-                    done = list(obj_sched.get("done") or [])
-                    if proc.returncode == 0:
-                        if target not in done:
-                            done.append(target)
-                        obj_sched["done"] = done
-                        schedule["objects"][obj_name] = obj_sched
-                        changed = True
-                        waiting_logged.discard(wait_key)
-                        log(f"inject ok object={obj_name} layer={target}")
-                    else:
-                        err = (proc.stderr or proc.stdout or "unknown error").strip()
-                        if len(err) > 400:
-                            err = err[:400] + "..."
-                        failed_logged.add(wait_key)
-                        log(f"inject failed object={obj_name} layer={target}: {err}")
+                else:
+                    if not heaters_alive(status):
+                        log("ABORT heaters dead before splice — no cold iron")
+                        stop_watching("heaters_off_before_splice")
+                        return 1
+                    if end_byte is not None and held_pos >= end_byte:
+                        log(
+                            f"ABORT held_pos={held_pos} >= PRINT_END={end_byte} "
+                            "before splice — no cold iron"
+                        )
+                        stop_watching("past_print_end_before_splice")
+                        return 1
 
-                    finished, reason = print_job_finished(
-                        get_print_status(), gcode_file, seen_printing=seen_printing
+                    log(
+                        f"SPLICE rest+iron+PRINT_END from_byte={held_pos} "
+                        f"print_end={end_byte} remaining={rest_pairs}"
                     )
-                    if finished:
-                        stop_watching(f"after_inject {reason}")
+                    rc2, err2 = splice_remaining(rest_pairs, held_pos)
+                    if rc2 != 0:
+                        log(f"splice failed: {err2}")
+                        # Do not M24 into PRINT_END tail — leave paused / abort.
+                        stop_watching("splice_failed")
+                        return 1
+
+                    mark_done(schedule, rest_pairs)
+                    schedule["active"] = False
+                    schedule_path.write_text(json.dumps(schedule, indent=2))
+                    log(f"splice ok remaining={rest_pairs}")
+                    stop_watching("splice_complete")
+                    return 0
+
+            else:
+                # Last / only object: normal M25/iron/M24.
+                log(
+                    f"inject FULL (last) file={gcode_file.name} "
+                    f"items={pairs_one} file_pos={file_pos} layer={layer}"
+                )
+                rc, err = iron_one_full(obj_name, target)
+                if rc != 0:
+                    failed_logged.add((obj_name, target))
+                    log(f"inject failed items={pairs_one}: {err}")
+                else:
+                    mark_done(schedule, pairs_one)
+                    schedule_path.write_text(json.dumps(schedule, indent=2))
+                    log(f"inject ok items={pairs_one}")
+                    if schedule_all_complete(schedule):
+                        schedule["active"] = False
+                        schedule_path.write_text(json.dumps(schedule, indent=2))
+                        log(f"all iron complete file={gcode_file.name}")
+                        stop_watching("all_complete")
                         return 0
 
-            if changed:
-                schedule_path.write_text(json.dumps(schedule, indent=2))
+                finished, reason = print_job_finished(
+                    get_print_status(), gcode_file, seen_printing=seen_printing
+                )
+                if finished:
+                    stop_watching(f"after_inject {reason}")
+                    return 0
 
-            if schedule_all_complete(schedule):
-                schedule["active"] = False
-                schedule_path.write_text(json.dumps(schedule, indent=2))
-
-            time.sleep(poll_sec)
+            # Loop immediately after work.
+            continue
     finally:
         lock_path.unlink(missing_ok=True)
 
